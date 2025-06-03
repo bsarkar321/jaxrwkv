@@ -22,7 +22,7 @@ authors = [
     {name = "Bidipta Sarkar", email = "bidiptas13@gmail.com"}
 ]
 dynamic = ["version"]
-license = {file = "LICENSE"}
+license = "GPL-3.0-only"
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python",
@@ -33,10 +33,9 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
 ]
 dependencies = [
-    "jax<=0.5.0",
+    "jax<0.6.0",
     "jaxlib",
     "huggingface_hub",
     "tokenizers",
@@ -49,6 +48,7 @@ cuda12 = [
     "jax[cuda12]"
 ]
 macos = [
+    "jax==0.5.0",
     "jax-metal",
 ]
 testing = [

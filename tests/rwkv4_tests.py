@@ -8,7 +8,7 @@ from functools import partial
 
 import time
 
-RWKV, params, config, tokenizer = get_model("4w0.1B", rwkv_type="BaseRWKV", verbose=True)#, dtype=jnp.float32)
+RWKV, params, config, tokenizer = get_model("4w0.1B", rwkv_type="AssociativeScanRWKV", verbose=True, dtype=jnp.float32)
 params = jax.device_put(params, jax.local_devices()[0]) # move it to gpu (or whatever the default device is)
 print(jax.tree.map(lambda x: x.device, params))
 
