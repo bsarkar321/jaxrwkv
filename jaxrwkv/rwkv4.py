@@ -1,0 +1,213 @@
+import jax
+import jax.numpy as jnp
+
+from functools import partial
+
+from .llm import LLM
+
+def layer_norm(x, w, eps=1e-5):
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.var(x, axis=-1, keepdims=True)
+    std = jnp.sqrt(var + eps)
+    return (x - mean) / std * w['weight'] + w['bias']
+
+
+class BaseRWKV(LLM):
+    @classmethod
+    def transform_torch_model(cls, torch_model, dtype=jnp.bfloat16):
+        w = torch_model
+        w['ln0.weight'] = w['blocks.0.ln0.weight']
+        w['ln0.bias'] = w['blocks.0.ln0.bias']
+        del w['blocks.0.ln0.weight']
+        del w['blocks.0.ln0.bias']
+        for k in w.keys():
+            if '.time_' in k:
+                w[k] = w[k].squeeze()
+        return w
+
+    @classmethod
+    def randomize_weights(cls, key, n_layer, n_embd, vocab_size, config, dtype):
+        raise NotImplementedError("Randomize Weights is not implemented")
+
+    @classmethod
+    def default_state(cls, params, config):
+        n_embd = params['emb']['weight'].shape[1]
+        n_layer = params['blocks']['att']['time_decay'].shape[0]
+        state = jnp.zeros((n_layer, 5, n_embd), dtype=params['emb']['weight'].dtype)
+        state = state.at[:, 4].set(-1e30)
+        return state
+
+    @classmethod
+    def embed(cls, params, config, tokens):
+        return params['emb']['weight'][tokens]
+    
+    @classmethod
+    def outhead(cls, params, config, x):
+        return layer_norm(x, params['ln_out']) @ params['head']['weight'].T
+
+    @classmethod
+    def channel_mixing_seq(cls, x, state, ffn, length, new_starts):
+        sx = jnp.concatenate([state, x[:-1, :]], dtype=x.dtype)
+        sx = jnp.where(new_starts[:, None], jnp.zeros_like(sx), sx)
+        xk = x * ffn['time_mix_k'] + sx * (1 - ffn['time_mix_k'])
+        xr = x * ffn['time_mix_r'] + sx * (1 - ffn['time_mix_r'])
+        r = jax.nn.sigmoid(xr @ ffn['receptance']['weight'].T)
+        k = jnp.square(jax.nn.relu(xk @ ffn['key']['weight'].T))
+        return r * (k @ ffn['value']['weight'].T), x[length - 1]
+
+    @classmethod
+    def inner_loop(cls, r, k, v, w, time_first, s, length, new_starts):
+        out = jnp.empty_like(r)
+        out_s = s
+
+        reset_s = jnp.zeros_like(s)
+        reset_s = reset_s.at[2].set(-1e30)
+
+        for t in range(r.shape[0]):
+            s = jax.lax.select(new_starts[t], reset_s, s)
+            aa, bb, pp = s
+
+            ww = time_first + k[t]
+            qq = jnp.maximum(pp, ww)
+            e1 = jnp.exp(pp - qq)
+            e2 = jnp.exp(ww - qq)
+            a = e1 * aa + e2 * v[t]
+            b = e1 * bb + e2
+            wkv = a / b
+            out = out.at[t].set(jnp.astype(r[t] * wkv, r.dtype))
+
+            ww = pp + w
+            qq = jnp.maximum(ww, k[t])
+            e1 = jnp.exp(ww - qq)
+            e2 = jnp.exp(k[t] - qq)
+
+            s = jnp.astype(jnp.stack([e1 * aa + e2 * v[t], e1 * bb + e2, qq]), r.dtype)
+            out_s = jax.lax.select(t < length, s, out_s)
+        return out_s, out
+
+    @classmethod
+    def time_mixing_seq(cls, x, state, att, length, new_starts):
+        T, C = x.shape
+
+        sx = jnp.concatenate([state[:1], x[:-1, :]], dtype=x.dtype)
+        sx = jnp.where(new_starts[:, None], jnp.zeros_like(sx), sx)
+        xk = x * att['time_mix_k'] + sx * (1 - att['time_mix_k'])
+        xv = x * att['time_mix_v'] + sx * (1 - att['time_mix_v'])
+        xr = x * att['time_mix_r'] + sx * (1 - att['time_mix_r'])
+        state = state.at[0].set(x[length-1])
+
+        r = jax.nn.sigmoid(xr @ att['receptance']['weight'].T)
+        k = xk @ att['key']['weight'].T
+        v = xv @ att['value']['weight'].T
+
+        time_decay = -jnp.exp(att['time_decay'])
+        
+        state_new, out = cls.inner_loop(r, k, v, time_decay, att['time_first'], state[1:], length, new_starts)
+        state = state.at[1:].set(state_new)
+        return out @ att['output']['weight'].T, state
+
+    @classmethod
+    def forward_seq(cls, params, config, x, state, length, new_starts):
+        x = layer_norm(x, params['ln0'])
+
+        @partial(jax.checkpoint,
+                 policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
+        def block_loop(x, inputs):
+            block, state = inputs
+            x_new, s = cls.time_mixing_seq(layer_norm(x, block['ln1']), state[1:], block['att'], length, new_starts)
+            state = state.at[1:].set(s)
+            x = x + x_new
+            
+            x_new, s = cls.channel_mixing_seq(layer_norm(x, block['ln2']), state[:1], block['ffn'], length, new_starts)
+            state = state.at[0].set(s)
+            x = x + x_new
+            return x, state
+
+        x, state = jax.lax.scan(block_loop, x, (params['blocks'], state))
+        return x, state
+
+
+class ScanRWKV(BaseRWKV):
+    @classmethod
+    def inner_loop(cls, r, k, v, w, time_first, s, length, new_starts):
+        idxes = jnp.arange(jnp.size(r, axis=0))
+        reset_s = jnp.zeros_like(s)
+        reset_s = reset_s.at[2].set(-1e30)
+        def scan_loop(inner_states, x):
+            out_s, inner_state = inner_states
+            r_t, k_t, v_t, t, reset = x
+
+            inner_state = jax.lax.select(new_starts[t], reset_s, inner_state)
+            aa, bb, pp = inner_state
+
+            ww = time_first + k_t
+            qq = jnp.maximum(pp, ww)
+            e1 = jnp.exp(pp - qq)
+            e2 = jnp.exp(ww - qq)
+            a = e1 * aa + e2 * v_t
+            b = e1 * bb + e2
+            wkv = a / b
+
+            out_t = jnp.astype(r_t * wkv, r.dtype)
+
+            ww = pp + w
+            qq = jnp.maximum(ww, k_t)
+            e1 = jnp.exp(ww - qq)
+            e2 = jnp.exp(k_t - qq)
+
+            state = jnp.astype(jnp.stack([e1 * aa + e2 * v[t], e1 * bb + e2, qq]), r.dtype)
+            out_s = jax.lax.select(t < length, state, out_s)
+            return (out_s, state), out_t
+        (s, _), out = jax.lax.scan(scan_loop, (s, s), (r, k, v, idxes, new_starts), unroll=64)
+        return jnp.astype(s, r.dtype), jnp.astype(out, r.dtype)
+
+
+class AssociativeScanRWKV(BaseRWKV):
+    @classmethod
+    def inner_loop(cls, r, k, v, w, time_first, s, length, new_starts):
+        T, C = r.shape
+
+        AA = jnp.concatenate((s[0:1], v), dtype=r.dtype)
+        BB = jnp.ones_like(AA)
+        BB = BB.at[0].set(s[1])
+        PP = jnp.concatenate((s[2:3], k), dtype=r.dtype)
+        EI = jnp.arange(T+1)[:, None]
+        new_starts = jnp.concatenate((new_starts, jnp.zeros_like(new_starts[:1])))[:, None]
+
+        AA = jnp.where(new_starts, jnp.zeros_like(AA), AA)
+        BB = jnp.where(new_starts, jnp.zeros_like(BB), BB)
+        PP = jnp.where(new_starts, jnp.ones_like(PP) * (-1e30), PP)
+
+        def a_scan_loop(elem1, elem2):
+            A1, B1, P1, E1, r1 = elem1
+            A2, B2, P2, E2, r2 = elem2
+
+            d = E2 - E1  # missing timesteps
+
+            ww = P1 + d * w
+            qq = jnp.maximum(ww, P2)
+            AN = A1 * jnp.exp(ww - qq) + A2 * jnp.exp(P2 - qq)
+            BN = B1 * jnp.exp(ww - qq) + B2 * jnp.exp(P2 - qq)
+            return (
+                jnp.where(r2, A2, AN),
+                jnp.where(r2, B2, BN),
+                jnp.where(r2, P2, qq),
+                E2,
+                jnp.where(r2, r2, r1)
+            )
+
+                    
+        AA, BB, PP, _, _ = jax.lax.associative_scan(a_scan_loop, (AA, BB, PP, EI, new_starts))
+        
+        aa = AA[:T]
+        bb = BB[:T]
+        pp = PP[:T]
+
+        ww = time_first[None] + k
+        qq = jnp.maximum(pp, ww)
+        e1 = jnp.exp(pp - qq)
+        e2 = jnp.exp(ww - qq)
+        a = e1 * aa + e2 * v
+        b = e1 * bb + e2
+        out = r * (a/b)
+        return jnp.stack([AA[length], BB[length], PP[length]]), out
