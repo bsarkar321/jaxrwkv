@@ -2,6 +2,9 @@ import jax
 import os
 from huggingface_hub.constants import HF_HOME
 
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_FLAGS'] = '--xla_gpu_deterministic_ops=true'
+
 jax.config.update("jax_compilation_cache_dir", os.path.join(HF_HOME, "jaxrwkvcomp"))
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
@@ -11,7 +14,7 @@ jax.config.update('jax_default_matmul_precision', 'highest')
 import jax.numpy as jnp
 import numpy as np
 
-from jaxrwkv import get_rand_model, get_model, models, versions
+from jaxrwkv import get_rand_model, get_model, models
 
 from functools import partial
 
@@ -27,17 +30,14 @@ import optax
 @dataclass
 class Args:
     seed: int = 0
-    version: Literal[tuple(versions.keys())] = "4"
     model_choice: Literal[tuple(models.keys())] =  "4w0.1B"
-    # n_layer: int = 3
-    # n_embd: int = 256
     vocab_size: int = 10
 
     batch_size: int = 1
     sequence_length: int = 32
     new_start_prob: float = 0.1
-    dtype: Optional[str] = None
-    rwkv_type: str = "ScanRWKV"
+    dtype: Optional[str] = "float32"
+    rwkv_type: str = "CudaRWKV"
     validation_rwkv_type: str = "ScanRWKV"
 
 
@@ -45,31 +45,13 @@ def construct_update_fn(forward_fn, include_state):
     def get_loss(params, tokens, full_state, lengths, new_starts):
         outs, state = forward_fn(params, tokens, full_state, lengths, new_starts)
 
-        loss_out = jnp.mean(outs ** 2)
-        loss_state = jnp.mean(jnp.clip(state ** 2, max=1.0))
-        # logits = outs[:, :-1]
-        # ans = tokens[:, 1:]
-        # loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, ans))
-        # return loss_out + loss_state
-        # return loss_state * 1000
-        return loss_out
+        logits = outs[:, :-1]
+        ans = tokens[:, 1:]
+        loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, ans))
+        return loss
 
     fast_loss = jax.jit(jax.value_and_grad(get_loss, argnums=(0, 2) if include_state else 0))
-    # fast_loss = jax.jit(get_loss)
-
     return fast_loss
-
-
-def print_tree(params, n=0):
-    if not isinstance(params, dict):
-        print(f":{params.shape} {params.dtype} {params.device}")
-        return
-    
-    print("{")
-    for k in params:
-        print("\t" * (n+1) + k, end="")
-        print_tree(params[k], n+1)
-    print("\t" * n + "}")
 
 
 def print_error_tree(params, o_params, n=0):
@@ -89,7 +71,7 @@ def print_error_tree(params, o_params, n=0):
     
 if __name__ == '__main__':
     args = tyro.cli(Args)
-    rwkv_file = versions[args.version]
+    rwkv_file = models[args.model_choice][0]
     VALID_RWKV = getattr(rwkv_file, args.validation_rwkv_type)
     RWKV, params, config, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
 
