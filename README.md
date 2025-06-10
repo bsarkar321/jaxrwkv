@@ -20,7 +20,7 @@ Use pip install to install this package. Additionally, add the optional requirem
   pip install -e ".[cuda12,testing]"
 ```
 
-For (experimental) custom cuda kernels, install the (jaxrwkvkernel)[https://github.com/bsarkar321/jaxrwkvkernel] package.
+For (experimental) custom cuda kernels, install the [jaxrwkvkernel](https://github.com/bsarkar321/jaxrwkvkernel) package.
 
 ## Usage Instructions
 
@@ -81,6 +81,7 @@ Example calls for RWKV4:
 python validate_torch.py --model_choice 4w0.1B --rwkv_type AssociativeScanRWKV --dtype float32
 python starts_and_length_test.py --model_choice 4w0.1B --rwkv_type AssociativeScanRWKV --dtype float32 # validation_rwkv_type can be anything that was previously validated by validate_torch
 python check_lambada.py --model_choice 4w0.1B --rwkv_type AssociativeScanRWKV --dtype float32
+python check_lambada_torch.py --model_choice 4w0.1B --dtype float32
 python rand_creation.py --version 4 --n_layer 3 --n_embd 256 --vocab_size 10 --dtype float32 --rwkv_type AssociativeScanRWKV
 python rand_grad_test.py --model_choice 4w0.1B --rwkv_type CudaRWKV --dtype float32 --batch_size 4 --sequence_length 32 --new_start_prob 0.1 --dtype float32 --validation_rwkv_type ScanRWKV
 ```
