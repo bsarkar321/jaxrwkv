@@ -58,7 +58,16 @@ if __name__ == '__main__':
 
     torch_out, torch_state = torch_model.forward(encoded, None)
     torch_out = torch_out.detach().float().cpu().numpy()
-    torch_state = np.stack([x.detach().float().cpu().numpy() for x in torch_state])
+    if torch_state[0].shape == torch_state[1].shape:
+        torch_state = np.stack([x.detach().float().cpu().numpy() for x in torch_state])
+    else:
+        new_torch_state = []
+        H = torch_state[1].shape[1]
+        for i in range(0, len(torch_state), 3):
+            new_torch_state.append(torch_state[i])
+            new_torch_state.extend(torch.unbind(torch_state[i+1].reshape((H, -1)), dim=0))
+            new_torch_state.append(torch_state[i+2])
+        torch_state = np.stack([x.detach().float().cpu().numpy() for x in new_torch_state])
 
     soft_torch_out = jax.nn.softmax(torch_out)
     t_values, t_indices = jax.lax.top_k(soft_torch_out, 10)
@@ -79,6 +88,8 @@ if __name__ == '__main__':
         print(f"{values[i].item() * 100}%: {tokenizer.decode([indices[i].item()])}")
     print("*"*100)
     print("TVD=", 0.5*jnp.sum(jnp.abs(soft_torch_out - soft_out)))
+    # print(jnp.mean(torch_state, axis=-1))
     compare_state = jnp.roll(state, -1, axis=1)
+    # print(jnp.mean(compare_state, axis=-1))
     print("State abs error:", jnp.mean(jnp.abs(jnp.ravel(torch_state) - jnp.ravel(compare_state))))
     print("State rel error:", jnp.mean(jnp.abs((jnp.ravel(torch_state) - jnp.ravel(compare_state))/jnp.ravel(torch_state))))

@@ -1,6 +1,6 @@
 from .tokenizer import GptTokenizer, WorldTokenizer
 
-from . import rwkv4
+from . import rwkv4, rwkv5, rwkv5_2
 
 from huggingface_hub.constants import HF_HOME
 from huggingface_hub import hf_hub_download
@@ -15,7 +15,9 @@ import jax.numpy as jnp
 suffix = ".model"
 
 versions = {
-    "4": rwkv4
+    "4": rwkv4,
+    "5": rwkv5,
+    "5_2": rwkv5_2,
 }
 
 models = {
@@ -24,6 +26,13 @@ models = {
     "4w1.5B": (rwkv4, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-4-world", filename="RWKV-4-World-1.5B-v1-fixed-20230612-ctx4096.pth")), None),
     "4w3B": (rwkv4, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-4-world", filename="RWKV-4-World-3B-v1-20230619-ctx4096.pth")), None),
     "4w7B": (rwkv4, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-4-world", filename="RWKV-4-World-7B-v1-20230626-ctx4096.pth")), None),
+
+    "5w0.1B": (rwkv5, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-5-world", filename="RWKV-5-World-0.1B-v1-20230803-ctx4096.pth")), None),
+    "5w0.4B": (rwkv5_2, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-5-world", filename="RWKV-5-World-0.4B-v2-20231113-ctx4096.pth")), None),
+    "5w1.5B": (rwkv5_2, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-5-world", filename="RWKV-5-World-1B5-v2-20231025-ctx4096.pth")), None),
+    "5w3B": (rwkv5_2, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-5-world", filename="RWKV-5-World-3B-v2-20231113-ctx4096.pth")), None),
+    "5w7B": (rwkv5_2, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-5-world", filename="RWKV-5-World-7B-v2-20240128-ctx4096.pth")), None),
+
 }
 
 def get_rand_model(seed, version, n_layer, n_embd, vocab_size, config=None, dtype=None, rwkv_type="ScanRWKV", verbose=False):
