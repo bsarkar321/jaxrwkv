@@ -45,7 +45,8 @@ def get_rand_model(seed, version, n_layer, n_embd, vocab_size, config=None, dtyp
         rwkv_params, config = load(path)
     else:
         key = jax.random.key(seed)
-        rwkv_params, config = RWKV.randomize_weights(key, n_layer, n_embd, vocab_size, config, dtype)
+        with jax.default_device(jax.devices("cpu")[0]):
+            rwkv_params, config = RWKV.randomize_weights(key, n_layer, n_embd, vocab_size, config, dtype)
         if verbose:
             print("saving to", path)
         save((rwkv_params, config), path)

@@ -8,7 +8,7 @@ from functools import partial
 
 import time
 
-RWKV, params, config, tokenizer = get_model("4w0.1B", rwkv_type="AssociativeScanRWKV", verbose=True, dtype=jnp.float32)
+RWKV, params, config, tokenizer = get_model("4w0.1B", rwkv_type="CudaRWKV", verbose=True, dtype=jnp.bfloat16)
 params = jax.device_put(params, jax.local_devices()[0]) # move it to gpu (or whatever the default device is)
 print(jax.tree.map(lambda x: x.device, params))
 
@@ -23,7 +23,7 @@ forward_jit = partial(RWKV.forward, config=config)
 
 print("RUNNING")
 start_time = time.time()
-out, state = jax.block_until_ready(forward_jit(params, encoded, init_state, len(encoded)))
+out, state = jax.block_until_ready(forward_jit(params, encoded, init_state, 1))#len(encoded)))
 end_time = time.time()
 print(f"Forward time: {end_time - start_time} seconds")
 out = out[len(encoded)-1]
@@ -34,6 +34,7 @@ for i in range(10):
 
 old_soft_out = soft_out
 
+print(f"State fingerprint: {jnp.mean(state)}")
 
 print("*"*100)
 
@@ -60,7 +61,7 @@ print(len(full_context))
 start_segments = jnp.zeros(len(full_context), dtype=jnp.bool)
 start_segments = start_segments.at[len(encoded) + len(encoded_answer)].set(True)
 start_time = time.time()
-full_out, state = jax.block_until_ready(forward_jit(params, full_context, init_state, len(full_context), start_segments))
+full_out, state = jax.block_until_ready(forward_jit(params, full_context, init_state, len(encoded), start_segments))
 end_time = time.time()
 print(f"Forward time: {end_time - start_time} seconds")
 out = full_out[len(full_context)-1]
@@ -78,7 +79,7 @@ values, indices = jax.lax.top_k(alt_soft_out, 10)
 for i in range(10):
     print(f"{values[i].item() * 100}%: {tokenizer.decode([indices[i].item()])}")
 
-    
+print(f"State fingerprint: {jnp.mean(state)}")
 print("*"*100)
 print("TVD is", 0.5 * jnp.sum(jnp.abs(soft_out - old_soft_out)))
 
