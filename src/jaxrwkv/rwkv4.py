@@ -361,10 +361,11 @@ def wkv4_fwd(k, v, w, time_first, s, length, new_starts):
 @wkv4_fwd.def_vmap
 def wkv4_fwd_vmap_rule(axis_size, in_batched, k, v, w, time_first, s, length, new_starts):
     k_batched, v_batched, w_batched, time_first_batched, s_batched, length_batched, new_starts_batched = in_batched
+    should_be_batched = [k_batched, v_batched, s_batched, length_batched, new_starts_batched]
+    vars_should_be_batched = [k, v, s, length, new_starts]
+    k, v, s, length, new_starts = tuple([var if is_batched else jnp.repeat(var[None], axis_size, axis=0) for is_batched, var in zip(should_be_batched, vars_should_be_batched)])
     assert not w_batched, "w cannot be batched"
     assert not time_first_batched, "time_first cannot be batched"
-    
-    # k, v, s, length, new_starts = jax.tree.map(lambda x, y: x if y else jnp.repeat(x[None], axis_size, axis=0), (k, v, s, length, new_starts), (k_batched, v_batched, s_batched, length_batched, new_starts_batched))
     
     return batched_wkv4_fwd(k, v, w, time_first, s, jnp.uint32(length), new_starts, k.shape[0]), ((True, True), tuple(in_batched))
 

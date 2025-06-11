@@ -193,7 +193,7 @@ class BaseRWKV(LLM):
 
     @classmethod
     def inner_loop(cls, r, w, k, v, a, b, s, length, new_starts):
-        w = jnp.exp(w)
+        w = jnp.exp(-jnp.exp(w))
         out = jnp.empty_like(r)
         out_s = s
 
@@ -248,7 +248,7 @@ class BaseRWKV(LLM):
 
         state = state.at[0].set(x[length-1])
         s = jnp.reshape(state[1:, :], (H, S, S))
-        w = -jnp.exp(w)
+        # w = -jnp.exp(w)
 
         r, w, k, v, a_i, b_i = tuple([val.reshape(T, H, S) for val in (r, w, k, v, -kk, kk * a)])
 
@@ -290,7 +290,7 @@ class BaseRWKV(LLM):
 class ScanRWKV(BaseRWKV):
     @classmethod
     def inner_loop(cls, r, w, k, v, a, b, s, length, new_starts):
-        w = jnp.exp(w)
+        w = jnp.exp(-jnp.exp(w))
         idxes = jnp.arange(jnp.size(r, axis=0))
         reset_s = jnp.zeros_like(s)
         def scan_loop(inner_states, x):
@@ -315,7 +315,7 @@ class ScanRWKV(BaseRWKV):
 class AssociativeScanRWKV(BaseRWKV):
     @classmethod
     def inner_loop(cls, r, w, k, v, a, b, s, length, new_starts):
-        w = jnp.exp(w)
+        w = jnp.exp(-jnp.exp(w))
 
         merge_fn = jax.vmap(jax.vmap((lambda wi, ai, bi: jnp.diag(wi) + jnp.outer(ai, bi))))
         v_outer = jax.vmap(jax.vmap(jnp.outer))
@@ -340,3 +340,128 @@ class AssociativeScanRWKV(BaseRWKV):
         out = (scan_s[1:] @ jnp.expand_dims(r, -1)).squeeze(-1)
         s = scan_s[length]
         return jnp.astype(s, r.dtype), jnp.astype(out, r.dtype)
+
+
+import os
+import ctypes
+import numpy as np
+import jaxrwkvkernel
+
+UNLOADED_KERNEL = True
+DO_BACKWARDS_WARNING = True
+
+def batched_wkv7_fwd(r, w, k, v, a, b, s, length, new_starts, B):
+    T = k.shape[-3]
+    H = k.shape[-2]
+    C = k.shape[-1]
+    dtype = k.dtype
+    assert all([x.dtype == dtype for x in [r, w, k, v, a, b, s]])
+    out_type = jax.ShapeDtypeStruct(k.shape, k.dtype)
+    s_restore_type = jax.ShapeDtypeStruct((B, H, T//16, C, C), jnp.float32)
+    sa_restore_type = jax.ShapeDtypeStruct((B, T, H, C), jnp.float32)
+    s_type = jax.ShapeDtypeStruct(s.shape, s.dtype)
+
+    dtype_str = "fp32" if dtype == jnp.float32 else "bf16"
+
+    # new_s, out = jax.ffi.ffi_call(f"wkv7-fwd-{dtype_str}", (s_type, out_type))(w, time_first, k, v, s, length, new_starts,
+    #                                                B=np.uint64(B),T=np.uint64(k.shape[-3]),H=np.uint64(k.shape[-2]))
+
+    out, s_restore, sa_restore, new_s = jax.ffi.ffi_call(f"wkv7-fwd-{dtype_str}",
+                                                  (out_type, s_restore_type, sa_restore_type, s_type))(
+                                                      w, r, k, v, a, b, s, length, new_starts,
+                                                      B=np.uint64(B),T=np.uint64(T),H=np.uint64(H))
+    return (new_s, out), (r, w, k, v, a, b, s, length, new_starts, s_restore, sa_restore)
+
+def batched_wkv7_bwd(res, grads, B):
+    r, w, k, v, a, b, s, length, new_starts, s_restore, sa_restore = res
+    gs_out, gy = grads
+
+    T = k.shape[-3]
+    H = k.shape[-2]
+    C = k.shape[-1]
+
+    dtype = k.dtype
+
+    gw_type = jax.ShapeDtypeStruct(w.shape, w.dtype)
+    gr_type = jax.ShapeDtypeStruct(r.shape, r.dtype)
+    gk_type = jax.ShapeDtypeStruct(k.shape, k.dtype)
+    gv_type = jax.ShapeDtypeStruct(v.shape, v.dtype)
+    ga_type = jax.ShapeDtypeStruct(a.shape, a.dtype)
+    gb_type = jax.ShapeDtypeStruct(b.shape, b.dtype)
+    gs_type = jax.ShapeDtypeStruct(s.shape, s.dtype)
+
+
+    dtype_str = "fp32" if dtype == jnp.float32 else "bf16"
+    global DO_BACKWARDS_WARNING
+    if DO_BACKWARDS_WARNING:
+        print(f"Using {dtype_str} bwd kernel")
+        print("WARNING: RWKV7 Cuda Kernels do not currently receive gradients from the output state or send gradients to the input state, making it unsuitable for state tuning. Gradients will also explode if you provided new_starts. Double check your results against AssociativeScanRWKV for correctness.")
+        DO_BACKWARDS_WARNING = False
+
+    assert T % 16 == 0, f"Must have sequence length ({T}) equal to a multiple of the chunk length (16)"
+
+    gw, gr, gk, gv, ga, gb, gs = jax.ffi.ffi_call(f"wkv7-bwd-{dtype_str}", (gw_type, gr_type, gk_type, gv_type, ga_type, gb_type, gs_type))(
+        w, r, k, v, a, b, s, length, new_starts, gy, s_restore, sa_restore, gs_out,
+        B=np.uint64(B),T=np.uint64(T),H=np.uint64(H))
+
+    # gs = jnp.zeros_like(gs)
+    return gr, gw, gk, gv, ga, gb, gs, jnp.zeros_like(length), jnp.zeros_like(new_starts)
+
+
+@jax.custom_batching.custom_vmap
+def wkv7_fwd(r, w, k, v, a, b, s, length, new_starts):
+    outs = batched_wkv7_fwd(r, w, k, v, a, b, s, jnp.uint32(length), new_starts, 1)
+    return outs
+
+@wkv7_fwd.def_vmap
+def wkv7_fwd_vmap_rule(axis_size, in_batched, r, w, k, v, a, b, s, length, new_starts):
+
+    if not in_batched[-1]:
+        new_starts = jnp.repeat(new_starts[None], axis_size, axis=0)
+
+    length = jnp.uint32(length)
+    if not in_batched[-2]:
+        length = jnp.repeat(length[None], axis_size, axis=0)
+    
+    assert all(in_batched[:-2]), f"everything must be batched {in_batched[:-2]}"
+    
+    return batched_wkv7_fwd(r, w, k, v, a, b, s, jnp.uint32(length), new_starts, k.shape[0]), ((True, True), tuple(in_batched) + (True, True))
+
+
+@jax.custom_batching.custom_vmap
+def wkv7_bwd(res, grads):
+    return batched_wkv7_bwd(res, grads, 1)
+
+@wkv7_bwd.def_vmap
+def wkv7_bwd_vmap_rule(axis_size, in_batched, res, grads):
+    return batched_wkv7_bwd(res, grads, axis_size), in_batched[0][:-2]
+
+@jax.custom_vjp
+def wkv7_cuda(r, w, k, v, a, b, s, length, new_starts):
+    return wkv7_fwd(r, w, k, v, a, b, s, length, new_starts)[0]
+
+wkv7_cuda.defvjp(wkv7_fwd, wkv7_bwd)
+
+
+
+class CudaRWKV(BaseRWKV):
+
+    @classmethod
+    def get_kernels(cls):
+        global UNLOADED_KERNEL
+        if UNLOADED_KERNEL:
+            print("LOADING KERNELS")
+            UNLOADED_KERNEL = False
+            SHARED_LIBRARY = os.path.join(os.path.dirname(jaxrwkvkernel.__file__), "lib_wkv7.so")
+            library = ctypes.cdll.LoadLibrary(SHARED_LIBRARY)
+            jax.ffi.register_ffi_target("wkv7-fwd-fp32", jax.ffi.pycapsule(library.WKV7FwdF32), platform="CUDA")
+            jax.ffi.register_ffi_target("wkv7-fwd-bf16", jax.ffi.pycapsule(library.WKV7FwdBF16), platform="CUDA")
+            
+            jax.ffi.register_ffi_target("wkv7-bwd-fp32", jax.ffi.pycapsule(library.WKV7BwdF32), platform="CUDA")
+            jax.ffi.register_ffi_target("wkv7-bwd-bf16", jax.ffi.pycapsule(library.WKV7BwdBF16), platform="CUDA")
+    
+    @classmethod
+    def inner_loop(cls, r, w, k, v, a, b, s, length, new_starts):
+        cls.get_kernels()
+        s, out = wkv7_cuda(r, w, k, v, a, b, s, length, new_starts)
+        return s, out
