@@ -83,6 +83,16 @@ python starts_and_length_test.py --model_choice 4w0.1B --rwkv_type AssociativeSc
 python check_lambada.py --model_choice 4w0.1B --rwkv_type AssociativeScanRWKV --dtype float32
 python check_lambada_torch.py --model_choice 4w0.1B --dtype float32
 python rand_creation.py --version 4 --n_layer 3 --n_embd 256 --vocab_size 10 --dtype float32 --rwkv_type AssociativeScanRWKV
-python rand_grad_test.py --model_choice 4w0.1B --rwkv_type CudaRWKV --dtype float32 --batch_size 4 --sequence_length 32 --new_start_prob 0.1 --dtype float32 --validation_rwkv_type ScanRWKV
+python rand_grad_test.py --model_choice 4w0.1B --rwkv_type CudaRWKV --batch_size 4 --sequence_length 32 --new_start_prob 0.1 --dtype float32 --validation_rwkv_type ScanRWKV
 ```
+
+## Implemented Features
+
+|         | BaseRWKV           | ScanRWKV           | AssociativeScanRWKV | CudaRWKV           |
+|---------|--------------------|--------------------|---------------------|--------------------|
+| rwkv4   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :white_check_mark: |
+| rwkv5   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                |
+| rwkv5_2 | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                |
+| rwkv6   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                |
+| rwkv7   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :white_check_mark: |
 
