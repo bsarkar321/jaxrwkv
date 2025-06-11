@@ -88,11 +88,12 @@ python rand_grad_test.py --model_choice 4w0.1B --rwkv_type CudaRWKV --batch_size
 
 ## Implemented Features
 
-|         | BaseRWKV           | ScanRWKV           | AssociativeScanRWKV | CudaRWKV           |
-|---------|--------------------|--------------------|---------------------|--------------------|
-| rwkv4   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :white_check_mark: |
-| rwkv5   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                |
-| rwkv5_2 | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                |
-| rwkv6   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                |
-| rwkv7   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :white_check_mark: |
+|         | BaseRWKV           | ScanRWKV           | AssociativeScanRWKV | CudaRWKV                 |
+|---------|--------------------|--------------------|---------------------|--------------------------|
+| rwkv4   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :heavy_exclamation_mark: |
+| rwkv5   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                      |
+| rwkv5_2 | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                      |
+| rwkv6   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :x:                      |
+| rwkv7   | :white_check_mark: | :white_check_mark: | :white_check_mark:  | :heavy_exclamation_mark: |
 
+:heavy_exclamation_mark: The CudaRWKV implementations for rwkv4 and rwkv7 are incomplete. Notably, neither support gradients from the output state (having the state output as part of the loss function) or into the initial state (state tuning). Additionally, rwkv7 does not support resetting in the middle of sequences due to the "chunked" nature of the cuda kernel. These will fail silently, so double check your outputs against AssociativeScanRWKV before initiating long training sessions.
