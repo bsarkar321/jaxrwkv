@@ -77,15 +77,25 @@ class BaseRWKV(LLM):
         
         params = {}
         h = jnp.arange(n_embd, dtype=dtype) / (n_embd - 1)
-        params['time_decay'] = jnp.reshape(jnp.astype(-6 + 5 * jnp.pow(h[None], 0.7 + 1.3 * ratio_0_to_1[:, None]), dtype), (n_layer, -1, 64))
+        params['time_decay'] = jnp.astype(-6 + 5 * jnp.pow(h[None], 0.7 + 1.3 * ratio_0_to_1[:, None]), dtype)
+        D_DECAY_LORA = 64
+        params['time_decay_w1'] = jnp.zeros((n_layer, n_embd, D_DECAY_LORA), dtype=dtype)
+        att_key, _key = jax.random.split(att_key)
+        params['time_decay_w2'] = jax.random.uniform(key=_key, shape=(n_layer, D_DECAY_LORA, n_embd), minval=-0.01, maxval=0.01).astype(dtype)
+        
         zigzag = ((jnp.arange(n_embd) + 1) % 3 - 1) * 0.1
         params['time_faaaa'] = jnp.reshape(jnp.astype(ratio_0_to_1[:, None] * (1-h) + zigzag[None], dtype), (n_layer, -1, 64, 1))
 
         x = jnp.arange(n_embd, dtype=dtype) / n_embd
-        params['time_mix_k'] = jnp.pow(x[None], ratio_1_to_almost_0[:, None])
-        params['time_mix_v'] = (jnp.pow(x[None], ratio_1_to_almost_0[:, None]) + 0.3 * ratio_0_to_1[:, None])
-        params['time_mix_r'] = jnp.pow(x[None], 0.5 * ratio_1_to_almost_0[:, None])
-        params['time_mix_g'] = jnp.pow(x[None], 0.5 * ratio_1_to_almost_0[:, None])
+        params['time_maa_x'] = 1 - jnp.pow(x[None], ratio_1_to_almost_0[:, None])
+        params['time_maa_w'] = 1 - jnp.pow(x[None], ratio_1_to_almost_0[:, None])
+        params['time_maa_k'] = 1 - jnp.pow(x[None], ratio_1_to_almost_0[:, None])
+        params['time_maa_v'] = 1 - (jnp.pow(x[None], ratio_1_to_almost_0[:, None]) + 0.3 * ratio_0_to_1[:, None])
+        params['time_maa_r'] = 1 - jnp.pow(x[None], 0.5 * ratio_1_to_almost_0[:, None])
+        params['time_maa_g'] = 1 - jnp.pow(x[None], 0.5 * ratio_1_to_almost_0[:, None])
+        D_MIX_LORA = 32
+        params['time_maa_w1'] = jnp.zeros((n_layer, n_embd, D_MIX_LORA * 5), dtype=dtype)
+        params['time_maa_w2'] = jnp.zeros((n_layer, 5, D_MIX_LORA, n_embd), dtype=dtype)
 
 
         orthos = jnp.astype(jax.random.orthogonal(att_key, n_embd, shape=(4, n_layer)), dtype)
@@ -105,8 +115,8 @@ class BaseRWKV(LLM):
         ratio_1_to_almost_0 = 1.0 - jnp.arange(n_layer, dtype=dtype) / (n_layer)
         params = {}
         x = jnp.arange(n_embd, dtype=dtype) / n_embd
-        params['time_mix_k'] = jnp.pow(x[None], ratio_1_to_almost_0[:, None])
-        params['time_mix_r'] = jnp.pow(x[None], ratio_1_to_almost_0[:, None])
+        params['time_maa_k'] = 1 - jnp.pow(x[None], ratio_1_to_almost_0[:, None])
+        params['time_maa_r'] = 1 - jnp.pow(x[None], ratio_1_to_almost_0[:, None])
 
         hidden_sz = int(3.5 * n_embd)
         params['key'] = {'weight': p_orthogonal_(ffn_key, n_layer, hidden_sz, n_embd, 1.0, dtype)}
@@ -137,8 +147,8 @@ class BaseRWKV(LLM):
     @classmethod
     def default_state(cls, params, config):
         n_embd = params['emb']['weight'].shape[1]
-        n_layer = params['blocks']['att']['time_decay'].shape[0]
-        n_head = params['blocks']['att']['time_decay'][0].shape[0]
+        n_layer = params['blocks']['att']['time_faaaa'].shape[0]
+        n_head = params['blocks']['att']['time_faaaa'][0].shape[0]
         head_size = params['blocks']['ln1']['weight'][0].shape[0] // n_head
         return jnp.zeros((n_layer, (2 + head_size), n_embd), dtype=params['emb']['weight'].dtype)
 
@@ -154,14 +164,16 @@ class BaseRWKV(LLM):
     def channel_mixing_seq(cls, x, state, ffn, length, new_starts):
         sx = jnp.concatenate([state, x[:-1, :]], dtype=x.dtype)
         sx = jnp.where(new_starts[:, None], jnp.zeros_like(sx), sx)
-        xk = x * ffn['time_mix_k'] + sx * (1 - ffn['time_mix_k'])
-        xr = x * ffn['time_mix_r'] + sx * (1 - ffn['time_mix_r'])
+        sx = sx - x
+        xk = x + sx * ffn['time_maa_k']
+        xr = x + sx * ffn['time_maa_r']
         r = jax.nn.sigmoid(xr @ ffn['receptance']['weight'].T)
         k = jnp.square(jax.nn.relu(xk @ ffn['key']['weight'].T))
         return r * (k @ ffn['value']['weight'].T), x[length - 1]
 
     @classmethod
     def inner_loop(cls, r, k, v, w, time_first, s, length, new_starts):
+        w = jnp.exp(w)
         out = jnp.empty_like(r)
         out_s = s
 
@@ -174,7 +186,7 @@ class BaseRWKV(LLM):
             vt = jnp.expand_dims(v[t], 1)
             at = kt@vt
             out = out.at[t].set((rt @ (time_first * at + s)).squeeze(1))
-            s = jnp.astype(at + w * s, r.dtype)
+            s = jnp.astype(at + w[t] * s, r.dtype)
             out_s = jax.lax.select(t < length, s, out_s)
         return out_s, out
 
@@ -184,10 +196,17 @@ class BaseRWKV(LLM):
 
         sx = jnp.concatenate([state[:1], x[:-1, :]], dtype=x.dtype)
         sx = jnp.where(new_starts[:, None], jnp.zeros_like(sx), sx)
-        xk = x * att['time_mix_k'] + sx * (1 - att['time_mix_k'])
-        xv = x * att['time_mix_v'] + sx * (1 - att['time_mix_v'])
-        xr = x * att['time_mix_r'] + sx * (1 - att['time_mix_r'])
-        xg = x * att['time_mix_g'] + sx * (1 - att['time_mix_g'])
+        sx = sx - x
+        xxx = x + sx * att['time_maa_x']
+        xxx = jnp.tanh(xxx @ att['time_maa_w1']).reshape(T, 5, -1).transpose(1, 0, 2)
+        xxx = jax.lax.batch_matmul(xxx, att['time_maa_w2']).reshape(5, T, -1)
+        mw, mk, mv, mr, mg = xxx
+
+        xw = x + sx * (att['time_maa_w'] + mw)
+        xk = x + sx * (att['time_maa_k'] + mk)
+        xv = x + sx * (att['time_maa_v'] + mv)
+        xr = x + sx * (att['time_maa_r'] + mr)
+        xg = x + sx * (att['time_maa_g'] + mg)
         state = state.at[0].set(x[length-1])
 
         r = jnp.reshape(xr @ att['receptance']['weight'].T, (T, H, S))
@@ -195,7 +214,8 @@ class BaseRWKV(LLM):
         v = jnp.reshape(xv @ att['value']['weight'].T, (T, H, S))
         g = jax.nn.silu(xg @ att['gate']['weight'].T)
 
-        w = jnp.expand_dims(jnp.exp(-jnp.exp(att['time_decay'])), -1)
+        w = att['time_decay'].reshape(1, H, S, 1) + (jnp.tanh(xw @ att['time_decay_w1']) @ att['time_decay_w2']).reshape(T, H, S, 1)
+        w = -jnp.exp(w)
         u = att['time_faaaa']
 
         s = jnp.reshape(state[1:, :],(H, S, S))
@@ -210,8 +230,8 @@ class BaseRWKV(LLM):
 
     @classmethod
     def forward_seq(cls, params, config, x, state, length, new_starts):
-        n_layer = params['blocks']['att']['time_decay'].shape[0]
-        n_head = params['blocks']['att']['time_decay'][0].shape[0]
+        n_layer = params['blocks']['att']['time_faaaa'].shape[0]
+        n_head = params['blocks']['att']['time_faaaa'][0].shape[0]
         head_size = params['blocks']['ln1']['weight'][0].shape[0] // n_head
         x = layer_norm(x, params['ln0'])
 
@@ -235,33 +255,34 @@ class BaseRWKV(LLM):
 class ScanRWKV(BaseRWKV):
     @classmethod
     def inner_loop(cls, r, k, v, w, time_first, s, length, new_starts):
+        w = jnp.exp(w)
         idxes = jnp.arange(jnp.size(r, axis=0))
         reset_s = jnp.zeros_like(s)
         def scan_loop(inner_states, x):
             out_s, inner_state = inner_states
-            r_t, k_t, v_t, t = x
+            r_t, k_t, v_t, w_t, t = x
             inner_state = jax.lax.select(new_starts[t], reset_s, inner_state)
             rt = jnp.expand_dims(r_t, 1)
             kt = jnp.expand_dims(k_t, 2)
             vt = jnp.expand_dims(v_t, 1)
             at = kt@vt
             out_t = jnp.astype((rt @ (time_first * at + inner_state)).squeeze(1), r_t.dtype) # set dtype here
-            state = jnp.astype(at + w * inner_state, r_t.dtype)
+            state = jnp.astype(at + w_t * inner_state, r_t.dtype)
             out_s = jax.lax.select(t < length, state, out_s)
             return (out_s, state), out_t
-        (s, _), out = jax.lax.scan(scan_loop, (s, s), (r, k, v, idxes), unroll=64)
+        (s, _), out = jax.lax.scan(scan_loop, (s, s), (r, k, v, w, idxes), unroll=64)
         return jnp.astype(s, r.dtype), jnp.astype(out, r.dtype)
 
 class AssociativeScanRWKV(BaseRWKV):
     @classmethod
     def inner_loop(cls, r, k, v, w, time_first, s, length, new_starts):
+        w = jnp.exp(w)
         R = jnp.expand_dims(r, 2)
         K = jnp.expand_dims(k, 3)
         V = jnp.expand_dims(v, 2)
 
         A = K @ V
         all_A = jnp.concatenate((s[None], A), dtype=r.dtype)
-        w = jnp.repeat(jnp.expand_dims(w, 0), A.shape[0], axis=0)
         all_W = jnp.concatenate((jnp.zeros_like(w[0:1]), w))
         new_starts = jnp.concatenate((new_starts, jnp.zeros_like(new_starts[:1])))[:, None, None, None]
 
