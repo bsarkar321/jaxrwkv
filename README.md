@@ -1,6 +1,6 @@
 # RWKV in Jax
 
-This repo contains pure jax implementations of RWKV4, RWKV5 (and 5.2), RWKV6, RWKV7, Mamba, and Mamba2. All implementations can be found under the src directory. There are also many convenience features, including:
+This repo contains pure jax implementations of RWKV4, RWKV5 (and 5.2), RWKV6, and RWKV7 (with Mamba, Mamba2, and SmolLM coming soon). All implementations can be found under the src directory. There are also many convenience features, including:
 - Generating final hidden states to enable constant-time generation.
 - Support for padding by specifying a "length" in the forward function. (Useful for vmap over sequences of different lengths)
 - Resetting in the middle of a sequence, which is helpful for RL training or combining multiple sequences when training.
@@ -24,7 +24,7 @@ For (experimental) custom cuda kernels, install the [jaxrwkvkernel](https://gith
 
 ## Usage Instructions
 
-You can find a list of supported models in src/jaxrwkv/auto.py as the "models" variable. Names are formatted as (Version)(Tokenizer)(Size); for instance, "4w0.1B" indicates RWKV4 using the World tokenizer with 0.1B parameters.
+You can find a list of supported models in src/jaxrwkv/auto.py as the "models" variable. Names are formatted as (Version)(Tokenizer)(Size); for instance, "4w0.1B" indicates RWKV4 using the World tokenizer with 0.1B parameters. Note that for RWKV7 models, "n" indicates pile models (for gpt "neo" tokenizer), "w" indicates world models, and "g" indicates the g1 reasoning models.
 
 Refer to src/jaxrwkv/llm.py for the general interface. Here is an example usage:
 

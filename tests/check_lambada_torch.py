@@ -2,7 +2,6 @@ import os
 os.environ['RWKV_JIT_ON'] = '1' if 'RWKV_JIT_ON' not in os.environ else os.environ['RWKV_JIT_ON']
 os.environ['RWKV_CUDA_ON'] = '1' if 'RWKV_CUDA_ON' not in os.environ else os.environ['RWKV_CUDA_ON']
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-from rwkv.model import RWKV as RWKV_TORCH
 
 
 import jax
@@ -39,7 +38,18 @@ if __name__ == '__main__':
 
     use_cuda = torch.cuda.is_available()
     
-    torch_model = RWKV_TORCH(model=models[args.model_choice][2](), strategy=('cuda' if use_cuda else 'cpu') + ' ' + ('bf16' if args.dtype == 'bfloat16' else 'fp32'))
+    version = args.model_choice[0]
+
+    if version == '7':
+        torch_name = models[args.model_choice][2]()[:-4]
+        os.environ['RWKV_V7_ON'] = '1'
+    else:
+        torch_name = models[args.model_choice][2]()
+
+    from rwkv.model import RWKV as RWKV_TORCH
+
+
+    torch_model = RWKV_TORCH(model=torch_name, strategy=('cuda' if use_cuda else 'cpu') + ' ' + ('bf16' if args.dtype == 'bfloat16' else 'fp32'))
     
     # params = jax.device_put(params, jax.local_devices()[0])
     

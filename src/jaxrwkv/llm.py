@@ -1,6 +1,10 @@
 import jax
 import jax.numpy as jnp
 
+def get_int_component(x):
+    parts = x.split('.')
+    return tuple([int(p) for p in parts if p.isdigit()])
+
 class LLM:
     @classmethod
     def transform_torch_model(cls, torch_model, dtype=jnp.bfloat16):
@@ -22,7 +26,7 @@ class LLM:
 
         ans = {}
         ans['blocks'] = {}
-        for k in w.keys():
+        for k in sorted(w.keys(), key=get_int_component):
             parts = k.split('.')
             last = parts.pop()
             here = ans
