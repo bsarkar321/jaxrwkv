@@ -7,6 +7,8 @@ This repo contains pure jax implementations of RWKV4, RWKV5 (and 5.2), RWKV6, an
 - Unified interface across all models.
 - Directly loading torch models from huggingface and running them in jax.
 
+For nearly all purposes, I'd recommend using the AssociativeScanRWKV implementations. The BaseRWKV is a naive for-loop, which will be slow to compile for long sequences, while the ScanRWKV turns the for-loop into a scan (but is still very slow to compile for training, especially for v7). Use the CudaRWKV implementation at your own risk; these are based on the official cuda kernels from RWKV-LM, but are still highly experimental and do not have all the convenience features at training time.
+
 ## Install Instructions
 
 Use pip install to install this package. Additionally, add the optional requirements of:
