@@ -345,7 +345,6 @@ class AssociativeScanRWKV(BaseRWKV):
 import os
 import ctypes
 import numpy as np
-import jaxrwkvkernel
 
 UNLOADED_KERNEL = True
 DO_BACKWARDS_WARNING = True
@@ -450,6 +449,7 @@ class CudaRWKV(BaseRWKV):
     def get_kernels(cls):
         global UNLOADED_KERNEL
         if UNLOADED_KERNEL:
+            import jaxrwkvkernel
             print("LOADING KERNELS")
             UNLOADED_KERNEL = False
             SHARED_LIBRARY = os.path.join(os.path.dirname(jaxrwkvkernel.__file__), "lib_wkv7.so")
