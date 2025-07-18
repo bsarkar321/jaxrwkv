@@ -72,7 +72,7 @@ class LLM:
         """
         Forward pass on a single stream of tokens
         """
-        tokens = jnp.array(tokens).ravel()
+        tokens = jnp.array(tokens)
         if length is None:
             length = jnp.size(tokens)
         if new_starts is None:
