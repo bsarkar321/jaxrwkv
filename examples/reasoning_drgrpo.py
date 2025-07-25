@@ -115,7 +115,7 @@ def generate_batch(key, RWKV, batch_forward, model, states, init_logits, batch_s
     # out will be list of (list of tokens)
 
 
-from math_verify import LatexExtractionConfig, parse, verify
+# from math_verify import LatexExtractionConfig, parse, verify
 
 
 # def accuracy_reward(completions, **kwargs):
@@ -135,22 +135,57 @@ from math_verify import LatexExtractionConfig, parse, verify
 #             rewards.append(1.0)
 #     return rewards
 
-def check_accuracy(solution, content):
-    gold_parsed = parse(solution, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
-    answer_parsed = parse(content, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
-    if len(gold_parsed) != 0:
-        try:
-            return float(verify(answer_parsed, gold_parsed))
-        except Exception:
-            print("EXCEPTION")
-            return 0.0
-            # rewards.append(0.0)
+# def check_accuracy(solution, content):
+#     gold_parsed = parse(solution, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
+#     answer_parsed = parse(content, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
+#     if len(gold_parsed) != 0:
+#         try:
+#             return float(verify(answer_parsed, gold_parsed))
+#         except Exception:
+#             print("EXCEPTION")
+#             return 0.0
+#             # rewards.append(0.0)
+#     else:
+#         print("UNABLE TO PARSE GOLD")
+#         return 1.0
+#         # rewards.append(1.0)
+
+import re
+
+# code from https://github.com/tianlwang/eval_gsm8k
+
+def extract_predicted_answer(text):
+    regex_pattern = "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+    regexes_to_ignore =[
+        ",",
+        "\\$",
+        "(?s).*#### ",
+        "\\.$"
+    ]
+    match = re.findall(regex_pattern, text)
+    if match:
+        match = match[-1]
+        if isinstance(match, tuple):
+            match = [m for m in match if m][0]
+        text = match.strip()
+
+        for regex in regexes_to_ignore:
+            text = re.sub(regex, "", text)
+        return text
     else:
-        print("UNABLE TO PARSE GOLD")
-        return 1.0
-        # rewards.append(1.0)
+        print("NO REGEX MATCH FOUND")
+        return None
 
+def extract_ground_truth(text):
+    return text.split('####')[-1].strip()
 
+def check_accuracy(generated_ans, solution):
+    ground_truth_answer = extract_ground_truth(solution)
+    # print(f"ground truth answer: {ground_truth_answer}")
+    # print("model answer (unparsed)", generated_ans.strip())
+    model_answer = extract_predicted_answer(generated_ans.strip())
+    print(f"model answer: {model_answer}; ground truth answer: {ground_truth_answer}")
+    return 1.0 if (model_answer == ground_truth_answer) else 0.0
 
 
 @dataclass
@@ -173,7 +208,8 @@ class Args:
     rl_batch_size: int = 10
     rl_seq_len: int = 64
 
-    lr: float = 1e-4
+    lr: float = 1e-5
+    clip_eps: float = 0.2
 
 args = tyro.cli(Args)
 assert args.gen_batch_size <= args.prompts_per_epoch * args.generations_per_prompt, f"{args.gen_batch_size} <= {args.prompts_per_epoch} * {args.generations_per_prompt}"
@@ -204,7 +240,7 @@ print(train_dataset[0]["prompt"])
 
 RWKV, params, config, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
 params = jax.device_put(params, jax.local_devices()[0]) # move it to gpu (or whatever the default device is)
-ref_params = jax.tree.map(lambda p: p.copy(), params)
+# ref_params = jax.tree.map(lambda p: p.copy(), params)
 solver = optax.adamw(args.lr)
 optimizer = solver.init(jax.tree.map(lambda p: p.copy(), params))
 init_state = RWKV.default_state(params, config)
@@ -219,23 +255,28 @@ num_epochs = len(train_dataset) // args.prompts_per_epoch
 
 key = jax.random.key(args.seed)
 
-def get_reward(generated_answer, true_answer):
+def get_reward(generated_answer, true_answer, i):
     find_idx = ans.find("</think>")
     if find_idx == -1:
+        print(i, "unable to find end of think")
+        print("*"*20)
+        print(ans)
+        print("*"*20)
         return 0.0
     true_idx = find_idx + len("</think>")
 
     generated_ans = ans[true_idx:]
-    content = batch_answers[i//args.generations_per_prompt]
+    # content = batch_answers[i//args.generations_per_prompt]
+    content = true_answer
 
     print("="*10, f" {i} ", "="*10)
     print("length=", len(tok_seq))
-    print("_"*20)
-    print(ans)
-    print("$" * 20, " PRED ANSWER ", "$"*20)
-    print(ans[true_idx:])
-    print("_" * 20, " TRUE ANSWER ", "_"*20)
-    print(batch_answers[i//args.generations_per_prompt])
+    # print("_"*20)
+    # print(ans)
+    # print("$" * 20, " PRED ANSWER ", "$"*20)
+    # print(ans[true_idx:])
+    # print("_" * 20, " TRUE ANSWER ", "_"*20)
+    # print(content)
     print("ACCURACY")
     acc = check_accuracy(generated_ans, content)
     print(i, acc)
@@ -250,18 +291,19 @@ def single_example_loss(params, ref_params, state, ref_state, tokens, answer_tok
     pi, state = forward(params, tokens, state)
     ref_pi, ref_state = forward(ref_params, tokens, ref_state)
     
-    pi_logprob = jax.nn.logsoftmax(pi)[jnp.arange(T), answer_tokens]
-    ref_pi_logprob = jax.nn.logsoftmax(ref_pi)[jnp.arange(T), answer_tokens]
+    pi_logprob = jax.nn.log_softmax(pi)[jnp.arange(T), answer_tokens]
+    ref_pi_logprob = jax.nn.log_softmax(ref_pi)[jnp.arange(T), answer_tokens]
     ratio = jnp.exp(pi_logprob - ref_pi_logprob)
     
-    token_loss = -jnp.min(
+    token_loss = -jnp.minimum(
         ratio * advantage,
         jnp.clip(ratio, 1-args.clip_eps, 1+args.clip_eps) * advantage
     )
     return jnp.sum(jnp.where(action_mask, token_loss, jnp.zeros_like(token_loss))) / T, (state, ref_state)
 
 def batch_loss(params, ref_params, state, ref_state, tokens, answer_tokens, action_mask, advantage):
-    losses, aux = jax.vmap(loss, in_axes=(None, None, 0, 0, 0, 0, 0, 0))(params, ref_params, state, ref_state, tokens, answer_tokens, action_mask, advantage)
+    print(state.shape, ref_state.shape, tokens.shape, answer_tokens.shape, action_mask.shape, advantage.shape)
+    losses, aux = jax.vmap(single_example_loss, in_axes=(None, None, 0, 0, 0, 0, 0, 0))(params, ref_params, state, ref_state, tokens, answer_tokens, action_mask, advantage)
     return jnp.mean(losses), aux
 
 fast_batch_grad = jax.value_and_grad(batch_loss, has_aux=True)
@@ -272,11 +314,11 @@ def do_update(params, optimizer, ref_params, state, ref_state, tokens, answer_to
     params = optax.apply_updates(params, updates)
     return params, optimizer, loss, state, ref_state
 
-fast_update_fn = jax.jit(do_update)
+fast_update_fn = jax.jit(do_update, donate_argnums=(0, 1))
 
-def convert_sample_to_buffer(last_prompt_tok, generation):
+def convert_sample_to_buffer(last_prompt_tok, generation, i):
     over_length = len(generation) % args.rl_seq_len
-    padding = [0] * (64-over_length if over_length > 0 else 0)
+    padding = np.zeros(args.rl_seq_len-over_length if over_length > 0 else 0, dtype=np.int32)
     full_true_prompt = np.concatenate(([last_prompt_tok], generation, padding))
     assert full_true_prompt.size % args.rl_seq_len == 1
     masks = np.zeros(full_true_prompt.size, dtype=bool)
@@ -293,12 +335,16 @@ def repad_rl_sequences(sequences, sequence_length, batch_size):
         sequences += [([0] * sequence_length, [0] * sequence_length, [False] * sequence_length, 0.0)] * (batch_size - len(sequences))
     return zip(*sequences)
 
-def rl_process_generations(params, ref_params, optimizer, update_fn, token_prompts, token_generations, default_state, advantages):
-    full_true_prompts, full_masks, prompt_iterations = list(zip(*[convert_sample_to_buffer(token_prompts[i//args.generations_per_prompt][-1], token_generations[i]) for i in range(len(token_generations))]))
+def rl_process_generations(params, optimizer, update_fn, token_prompts, token_generations, default_state, advantages):
+    ref_params = jax.tree.map(lambda p: p.copy(), params)
+    full_true_prompts, full_masks, prompt_iterations = list(zip(*[convert_sample_to_buffer(token_prompts[i//args.generations_per_prompt][-1], token_generations[i], i) for i in range(len(token_generations))]))
 
     _, prompt_states = preprocess_prompts(RWKV, batch_forward, params, token_prompts, default_state, sequence_length=args.preprocess_seq_len, batch_size=args.preprocess_batch_size)
     _, prompt_states_ref = preprocess_prompts(RWKV, batch_forward, ref_params, token_prompts, default_state, sequence_length=args.preprocess_seq_len, batch_size=args.preprocess_batch_size)
 
+    # print("advantages", advantages)
+    # print("prompt iterations", prompt_iterations)
+    
     generation_states = jnp.repeat(prompt_states, args.generations_per_prompt, axis=0)
     generation_states_ref = jnp.repeat(prompt_states_ref, args.generations_per_prompt, axis=0)
 
@@ -307,8 +353,12 @@ def rl_process_generations(params, ref_params, optimizer, update_fn, token_promp
 
     batch_size = args.rl_batch_size
 
+    pbar = tqdm(total=sum(prompt_iterations))
+
+    losses = []
+    
     while len(generations_to_handle) > 0:
-        selected_generation_idxes = generations_to_handle[batch_size]
+        selected_generation_idxes = generations_to_handle[:batch_size]
         true_num_generations_processed = len(selected_generation_idxes)
         
         selected_states = jnp.concatenate((generation_states[jnp.array(selected_generation_idxes)], jnp.repeat(default_state[None], batch_size-true_num_generations_processed, axis=0)))
@@ -316,7 +366,9 @@ def rl_process_generations(params, ref_params, optimizer, update_fn, token_promp
 
         rl_tokens, rl_answer_tokens, rl_action_mask, rl_advantages = repad_rl_sequences([get_rl_input(full_true_prompts[i], full_masks[i], advantages[i], current_length[i], args.rl_seq_len) for i in selected_generation_idxes], args.rl_seq_len, batch_size)
 
-        params, optimizer, loss, new_selected_states, new_selected_states_ref = update_fn(params, optimizer, ref_params, selected_states, selected_states_ref, rl_tokens, rl_answer_tokens, rl_action_mask, rl_advantages)
+        params, optimizer, loss, new_selected_states, new_selected_states_ref = update_fn(params, optimizer, ref_params, selected_states, selected_states_ref, jnp.array(rl_tokens), jnp.array(rl_answer_tokens), jnp.array(rl_action_mask), jnp.array(rl_advantages))
+        # print("loss=", loss)
+        losses.append(loss)
 
         generation_states = generation_states.at[jnp.array(selected_generation_idxes)].set(new_selected_states[:true_num_generations_processed])
         generation_states_ref = generation_states_ref.at[jnp.array(selected_generation_idxes)].set(new_selected_states_ref[:true_num_generations_processed])
@@ -327,11 +379,15 @@ def rl_process_generations(params, ref_params, optimizer, update_fn, token_promp
             if current_length[idx] == prompt_iterations[idx]:
                 generations_to_handle.remove(idx)
 
+        pbar.update(true_num_generations_processed)
+
+    print("losses", losses)
+
     return params, optimizer
 
 
 for t in range(num_epochs):
-    print("epoch", t)
+    print(f"epoch {t}/{num_epochs}")
 
     batch_answers = [train_dataset[t * args.prompts_per_epoch + i]["answer"] for i in range(args.prompts_per_epoch)]
 
@@ -358,19 +414,17 @@ for t in range(num_epochs):
     rewards = []
     
     for i, tok_seq in enumerate(generated_tokens):
-        try:
-            ans = tokenizer.decode(tok_seq)
-            reward = get_reward(ans, batch_answers[i//args.generations_per_prompt])
-        except:
-            print("ERROR DECODING; invalid generation")
-            reward = 0.0
+        ans = tokenizer.decode(tok_seq)
+        reward = get_reward(ans, batch_answers[i//args.generations_per_prompt], i)
             
         rewards.append(reward)
 
     np_rewards = np.array(rewards).reshape((-1, args.generations_per_prompt))
-    np_advantages = np_rewards - np.mean(np_rewards, axis=-1)
+    np_advantages = (np_rewards - np.mean(np_rewards, axis=-1, keepdims=True)).flatten()
+    print("ACCURACY:", np.mean(np_rewards))
+    print("LENGTHS:", [len(x) for x in generated_tokens])
 
-    params, optimizer = rl_process_generations(params, ref_params, optimizer, fast_update_fn, batch_prompts, generated_tokens, init_state, np_advantages)
+    params, optimizer = rl_process_generations(params, optimizer, fast_update_fn, batch_prompts, generated_tokens, init_state, np_advantages)
 
 # print("Starting preprocess")
 # out, state = jax.block_until_ready(forward(params, encoded, init_state))
