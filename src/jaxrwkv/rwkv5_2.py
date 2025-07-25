@@ -144,7 +144,7 @@ class BaseRWKV(LLM):
 
     @classmethod
     def embed(cls, params, config, tokens):
-        return params['emb']['weight'][tokens]
+        return params['emb']['weight'][tokens.ravel()]
     
     @classmethod
     def outhead(cls, params, config, x):

@@ -73,11 +73,12 @@ class LLM:
         Forward pass on a single stream of tokens
         """
         tokens = jnp.array(tokens)
-        if length is None:
-            length = jnp.size(tokens)
-        if new_starts is None:
-            new_starts = jnp.zeros(tokens.shape, dtype=jnp.bool)
         x = cls.embed(params, config, tokens)
+        T, D = x.shape
+        if length is None:
+            length = T
+        if new_starts is None:
+            new_starts = jnp.zeros((T,), dtype=jnp.bool)
         x, state = cls.forward_seq(params, config, x, state, length, new_starts)
         x = cls.outhead(params, config, x)
         return x, state

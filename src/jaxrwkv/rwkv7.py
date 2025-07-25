@@ -59,6 +59,7 @@ class BaseRWKV(LLM):
     @classmethod
     def transform_torch_model(cls, torch_model, dtype=jnp.bfloat16):
         import torch
+        import re
         w = torch_model
         w['ln0.weight'] = w['blocks.0.ln0.weight']
         w['ln0.bias'] = w['blocks.0.ln0.bias']
@@ -67,7 +68,11 @@ class BaseRWKV(LLM):
         w['blocks.0.att.v2'] = torch.zeros_like(w['blocks.1.att.v2'])
         del w['blocks.0.ln0.weight']
         del w['blocks.0.ln0.bias']
-        for k in w.keys():
+        keys = list(w.keys())
+        for k in keys:
+            if re.match(r'^blocks\.\d+\.ln0\.(weight|bias)$', k):
+                print("removing", k)
+                del w[k]
             if '.x_' in k or '.k_' in k or '.a0' in k or '.v0' in k or '.w0' in k:
                 w[k] = w[k].squeeze()
         return w
@@ -176,7 +181,7 @@ class BaseRWKV(LLM):
 
     @classmethod
     def embed(cls, params, config, tokens):
-        return params['emb']['weight'][tokens]
+        return params['emb']['weight'][tokens.ravel()]
     
     @classmethod
     def outhead(cls, params, config, x):
@@ -462,6 +467,8 @@ class CudaRWKV(BaseRWKV):
     
     @classmethod
     def inner_loop(cls, r, w, k, v, a, b, s, length, new_starts):
+        if r.shape[0] == 1:
+            return BaseRWKV.inner_loop(r, w, k, v, a, b, s, length, new_starts)
         cls.get_kernels()
         s, out = wkv7_cuda(r, w, k, v, a, b, s, length, new_starts)
         return s, out
