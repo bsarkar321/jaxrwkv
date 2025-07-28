@@ -253,7 +253,6 @@ class BaseRWKV(LLM):
 
         state = state.at[0].set(x[length-1])
         s = jnp.reshape(state[1:, :], (H, S, S))
-        # w = -jnp.exp(w)
 
         r, w, k, v, a_i, b_i = tuple([val.reshape(T, H, S) for val in (r, w, k, v, -kk, kk * a)])
 

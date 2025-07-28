@@ -185,10 +185,8 @@ class BaseRWKV(LLM):
         r = jax.nn.sigmoid(xr @ att['receptance']['weight'].T)
         k = xk @ att['key']['weight'].T
         v = xv @ att['value']['weight'].T
-
-        time_decay = att['time_decay']
         
-        state_new, out = cls.inner_loop(r, k, v, time_decay, att['time_first'], state[1:], length, new_starts)
+        state_new, out = cls.inner_loop(r, k, v, att['time_decay'].copy(), att['time_first'].copy(), state[1:], length, new_starts)
         state = state.at[1:].set(state_new)
         return out @ att['output']['weight'].T, state
 

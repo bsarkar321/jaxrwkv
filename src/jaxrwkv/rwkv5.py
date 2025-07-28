@@ -191,8 +191,8 @@ class BaseRWKV(LLM):
         k = jnp.reshape(xk @ att['key']['weight'].T, (T, H, S))
         v = jnp.reshape(xv @ att['value']['weight'].T, (T, H, S))
 
-        w = jnp.reshape(jnp.exp(-jnp.exp(att['time_decay'])), (-1, 1, 1))
-        u = jnp.reshape(jnp.exp(att['time_first']), (-1, 1, 1))
+        w = jnp.reshape(jnp.exp(-jnp.exp(att['time_decay'].copy())), (-1, 1, 1))
+        u = jnp.reshape(jnp.exp(att['time_first'].copy()), (-1, 1, 1))
 
         s = jnp.reshape(state[1:, :],(H, S, S))
 

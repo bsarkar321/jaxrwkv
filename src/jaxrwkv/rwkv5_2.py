@@ -195,8 +195,8 @@ class BaseRWKV(LLM):
         v = jnp.reshape(xv @ att['value']['weight'].T, (T, H, S))
         g = jax.nn.silu(xg @ att['gate']['weight'].T)
 
-        w = jnp.expand_dims(jnp.exp(-jnp.exp(att['time_decay'])), -1)
-        u = att['time_faaaa']
+        w = jnp.expand_dims(jnp.exp(-jnp.exp(att['time_decay'].copy())), -1)
+        u = att['time_faaaa'].copy()
 
         s = jnp.reshape(state[1:, :],(H, S, S))
 

@@ -199,7 +199,7 @@ class BaseRWKV(LLM):
         sx = sx - x
         xxx = x + sx * att['time_maa_x']
         xxx = jnp.tanh(xxx @ att['time_maa_w1']).reshape(T, 5, -1).transpose(1, 0, 2)
-        xxx = jax.lax.batch_matmul(xxx, att['time_maa_w2']).reshape(5, T, -1)
+        xxx = jax.vmap(lambda x, y: x @ y)(xxx, att['time_maa_w2']).reshape(5, T, -1)
         mw, mk, mv, mr, mg = xxx
 
         xw = x + sx * (att['time_maa_w'] + mw)
