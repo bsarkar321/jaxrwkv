@@ -40,17 +40,18 @@ class Args:
     rwkv_type: str = "AssociativeScanRWKV"
 
     context_length: int = 1024
-    batch_size: int = 1
+    batch_size: int = 8
 
     process_resets: bool = True
 
     dp_axis_size: int = 1
     fsdp_axis_size: int = -1
+
+    lr: float = 1e-4
     
 def get_update_function(args, forward_fn, state_fn, solver, param_sharding, opt_sharding):
 
     def loss(params, tokens):
-        print(tokens.shape)
         resets = (tokens == 0)
         logits, _ = forward_fn(params, tokens, state_fn(params), new_starts=resets if args.process_resets else None)
         do_xent = 1.0 - resets[1:]
@@ -59,13 +60,14 @@ def get_update_function(args, forward_fn, state_fn, solver, param_sharding, opt_
 
     def batch_loss(params, tokens):
         local_loss = jnp.mean(jax.vmap(jax.vmap(loss, in_axes=(None, 0)), in_axes=(None, 0))(params, tokens))
-        return jax.lax.pmean(jax.lax.pmean(local_loss, "fsdp"), "dp")
+        return local_loss
 
     fast_batch_grad = jax.value_and_grad(batch_loss)
 
     @partial(shard_map, mesh=mesh, in_specs=(param_sharding, opt_sharding, P("dp", "fsdp", None)), out_specs=(param_sharding, opt_sharding, P()), check_rep=True)
     def do_update(params, optimizer, tokens_batch):
         loss, grad = fast_batch_grad(params, tokens_batch)
+        loss = jax.lax.pmean(jax.lax.pmean(loss, "fsdp"), "dp")
         grad = jax.lax.pmean(jax.tree.map(sync_grads, grad, is_leaf=lambda x: isinstance(x, Partitioned)), "dp")
         updates, optimizer = solver.update(grad, optimizer, params)
         params = optax.apply_updates(params, updates)
@@ -87,13 +89,12 @@ def main():
     print("creating initial model")
     RWKV, params, config = get_rand_model(args.seed, args.version, args.n_layer, args.n_embd, args.vocab_size, dtype=args.dtype, rwkv_type=args.rwkv_type, verbose=True)
     print("original params shape", jax.tree.map(lambda x: x.shape, params))
-    # params = jax.device_put(params, jax.local_devices()[0])
     params = jax.tree.map(lambda x: shard_param(x, mesh, "fsdp"), params)
-    print("sharded params shape", jax.tree.map(lambda x: x.v.shape, params, is_leaf=lambda x: isinstance(x, Partitioned)))
+    # print("sharded params shape", jax.tree.map(lambda x: x.v.shape, params, is_leaf=lambda x: isinstance(x, Partitioned)))
     
     print("Number of parameters:", jax.tree.reduce(lambda *x: sum(x), jax.tree.map(jnp.size, params)) / 1000000, "million")
 
-    solver = optax.adamw(1.0)
+    solver = optax.adamw(args.lr)
     optimizer = solver.init(jax.tree.map(lambda p: p.copy(), params))
     optimizer = jax.tree.map(lambda x: jax.device_put(x, NamedSharding(mesh, P())) if isinstance(x.sharding, SingleDeviceSharding) else x, optimizer)
     param_sharding = jax.tree.map(lambda x: x.sharding.spec, params)
