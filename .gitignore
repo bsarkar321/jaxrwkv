@@ -3,3 +3,4 @@
 jaxrwkv.egg-info
 dist/
 **/*.npy
+examples/experimental/wandb/
