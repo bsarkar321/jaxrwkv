@@ -20,10 +20,14 @@ import tqdm
 from typing import Optional, Literal
 
 import time
-
 import wandb
 
 import numpy as np
+
+from simple_reward_functions import reward_functions # local import
+
+import operator
+
 
 @dataclass
 class Args:
@@ -33,19 +37,21 @@ class Args:
     rwkv_type: str = "CudaRWKV"
     dtype: Optional[str] = None
 
-    parallel_generations: int = 128
+    parallel_generations: int = 1024
     generation_length: int = 100
 
-    num_epochs: int = 10
+    num_epochs: int = 100
 
-    lr: float = 1e-5
-    evo_sigma: float = 1e-5
+    lr: float = 1e-4
+    evo_sigma: float = 1e-3
     lora_dim: int = 1
 
     use_antithetic: bool = True
 
+    reward_fn: Literal[tuple(reward_functions.keys())] = "fastzero"
+
     wandb_project: str = "evorwkv"
-    wandb_name: str = "base"
+    wandb_name: str = "full"
     track: bool = True
 
     freeze_lora: bool = False
@@ -53,18 +59,10 @@ class Args:
 
 args = tyro.cli(Args)
 
+RWKV, params, config, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
+
 if args.use_antithetic:
     assert args.parallel_generations % 2 == 0, "With antithetic generations, there should be even number of parallel generations"
-
-RWKV, params, config, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
-params = jax.device_put(params, jax.local_devices()[0]) # move it to gpu (or whatever the default device is)
-init_state = RWKV.default_state(params, config)
-init_states = jnp.repeat(init_state[None], args.parallel_generations, axis=0)
-
-params_shape = jax.tree.map(lambda x:x.shape, params)
-print(params_shape)
-print("mean parameter sizes")
-print(jax.tree.map(lambda x:jnp.mean(jnp.abs(x)), params))
 
 
 ###### Evolution Model Implementation
@@ -72,9 +70,6 @@ print(jax.tree.map(lambda x:jnp.mean(jnp.abs(x)), params))
 def evo_lora2(M, param, key):
     if args.freeze_lora:
         return M@param
-    # else:
-    #     print("SKIPPING LORA2")
-    #     return M @ (param + jax.random.normal(key[0], param.shape, dtype=param.dtype) * key[1])
     # Replacement for M @ param; param is axb, M is cxa; need M @ params.T + (M @ A.T) @ B.T, so B is bxl and A is lxa
     a, b = param.shape
     lora_params = jax.random.normal(key[0], (a+b, args.lora_dim), dtype=param.dtype) * key[1]
@@ -86,9 +81,6 @@ def evo_lora2(M, param, key):
 def evo_lora(M, param, key):
     if args.freeze_lora:
         return M@param.T
-    # else:
-    #     print("SKIPPING LORA")
-    #     return M@evo(param,key).T
     # Replacement for M @ param.T; param is axb, M is cxb; need M @ params.T + (M @ B) @ A, so B is bxl and A is lxa
     a, b = param.shape
     lora_params = jax.random.normal(key[0], (a+b, args.lora_dim), dtype=param.dtype) * key[1]
@@ -220,7 +212,7 @@ batch_forward = jax.jit(jax.vmap(partial(EvoRWKV.evo_forward, config=config), in
 def _forward_and_sample(model, model_keys, input_tokens, input_states, generation_key):
     print("RECOMPILE")
     gen_keys, _gen_keys = jax.vmap(jax.random.split, out_axes=1)(generation_key)
-    generated_outs, generated_states = jax.block_until_ready(batch_forward(model, model_keys, input_tokens, init_states))
+    generated_outs, generated_states = jax.block_until_ready(batch_forward(model, model_keys, input_tokens, input_states))
     sampled_toks = jax.vmap(jax.random.categorical)(_gen_keys, generated_outs[:, -1:])
     return sampled_toks, generated_states, gen_keys
 
@@ -228,43 +220,16 @@ UNCHANGED = 0
 FULL = 1
 LORA = 2
 
-lora_map = {
-    'blocks': {
-        'att': {
-            'a0': FULL,
-            'a1': LORA,
-            'a2': LORA,
-            'g1': LORA,
-            'g2': LORA,
-            'k_a': FULL,
-            'k_k': FULL,
-            'key': {'weight': LORA},
-            'ln_x': {'bias': FULL, 'weight': FULL},
-            'output': {'weight': LORA},
+lora_map = {'blocks': {
+    'att': {'a0': FULL, 'a1': LORA, 'a2': LORA, 'g1': LORA, 'g2': LORA, 'k_a': FULL, 'k_k': FULL, 'key': {'weight': LORA},
+            'ln_x': {'bias': FULL, 'weight': FULL}, 'output': {'weight': LORA},
             'r_k': FULL, # LORA EXCEPTION
             'receptance': {'weight': LORA},
-            'v0': FULL,
-            'v1': LORA,
-            'v2': LORA,
+            'v0': FULL, 'v1': LORA, 'v2': LORA,
             'value': {'weight': LORA},
-            'w0': FULL,
-            'w1': LORA,
-            'w2': LORA,
-            'x_a': FULL,
-            'x_g': FULL,
-            'x_k': FULL,
-            'x_r': FULL,
-            'x_v': FULL,
-            'x_w': FULL
-        },
-        'ffn': {
-            'key': {'weight': LORA},
-            'value': {'weight': LORA},
-            'x_k': FULL
-        },
-        'ln1': {'bias': FULL, 'weight': FULL},
-        'ln2': {'bias': FULL, 'weight': FULL}
-    },
+            'w0': FULL, 'w1': LORA, 'w2': LORA, 'x_a': FULL, 'x_g': FULL, 'x_k': FULL, 'x_r': FULL, 'x_v': FULL, 'x_w': FULL},
+    'ffn': {'key': {'weight': LORA}, 'value': {'weight': LORA}, 'x_k': FULL},
+    'ln1': {'bias': FULL, 'weight': FULL}, 'ln2': {'bias': FULL, 'weight': FULL}},
     'emb': {'weight': UNCHANGED},
     'head': {'weight': UNCHANGED},
     'ln0': {'bias': FULL, 'weight': FULL},
@@ -294,71 +259,34 @@ def _generate_batch(params, model_keys, gen_keys):
     _, out_tokens = jax.lax.scan(inner_scan, (input_toks, init_states, gen_keys), length=args.generation_length)
     return out_tokens.T
 
-def single_fitness(generated_tokens):
-    return -jax.numpy.nonzero(generated_tokens == 0, size=1, fill_value=args.generation_length*2)[0][0].astype(jnp.float32)
+batch_fitness = reward_functions[args.reward_fn]    
 
 def simple_full_update(param, key, scores, lr):
     if args.freeze_nonlora:
         return param
-    # theta + alpha / (n*sigma) * sum(fitness * noise)
-    # print("FULL")
     true_key, sigma = key
     noises = jax.vmap(partial(jax.random.normal, shape=param.shape, dtype=param.dtype))(true_key)
     broadcasted_scores = jnp.reshape(scores, scores.shape + (1,) * len(param.shape))
     broadcasted_sigma = jnp.reshape(sigma, sigma.shape + (1,) * len(param.shape))
-    # print("simple update", param.shape, noises.shape, broadcasted_scores.shape)
     return jnp.astype(param + lr * jnp.mean(broadcasted_scores * noises / broadcasted_sigma, axis=0), param.dtype)
 
 def simple_lora_update(param, key, scores, lr):
     if args.freeze_lora:
         return param
-    # else:
-    #     print("DOING UPDATE", param.shape)
-    #     true_key, sigma = key
-    #     noises = jax.vmap(partial(jax.random.normal, shape=param.shape, dtype=param.dtype))(true_key)
-    #     broadcasted_scores = jnp.reshape(scores, scores.shape + (1,) * len(param.shape))
-    #     broadcasted_sigma = jnp.reshape(sigma, sigma.shape + (1,) * len(param.shape)) / lr
-    #     # jax.debug.print("broadcasted sigma: {x}", x=broadcasted_sigma.ravel())
-    #     actual_grad = jnp.mean(broadcasted_scores * noises / broadcasted_sigma, axis=0)
-    #     # jax.debug.print("actual grad: {x}", x=jnp.mean(jnp.abs(actual_grad)))
-    #     return jnp.astype(param + actual_grad, param.dtype)
-    # theta + alpha / (n*sigma) * sum(fitness * noise)
-    # print("LORA")
     a, b = param.shape
     true_key, sigma = key
-    # jax.debug.print("true keys: {keys}", keys=true_key)
     noises = jax.vmap(partial(jax.random.normal, shape=(a+b, args.lora_dim), dtype=param.dtype))(true_key)
     Bs = noises[:, :b] # Bxbxl
     As = jnp.ones_like(noises[:, b:]) # Bxaxl
     broadcasted_scores = jnp.reshape(scores, scores.shape + (1,) * len(param.shape))
     broadcasted_sigma = jnp.reshape(sigma, sigma.shape + (1,) * len(param.shape)) / lr
-    # jax.debug.print("broadcasted sigma: {x}", x=broadcasted_sigma.ravel())
-
-    # print("Shapes", param.shape, broadcasted_scores.shape, As.shape, Bs.shape, broadcasted_sigma.shape)
-    # print("B nonmean shape", (broadcasted_scores / broadcasted_sigma * Bs).shape)
 
     preB = broadcasted_scores / broadcasted_sigma * Bs
-    preA = As # broadcasted_scores / broadcasted_sigma * As
+    preA = As
 
-    # jax.debug.print("preB: {x}, preA: {y}", x=jnp.mean(jnp.abs(preB)), y=jnp.mean(jnp.abs(preA)))
-    # jax.debug.print("broadcast mult: {x}", x=(broadcasted_scores / broadcasted_sigma).ravel())
-    # jax.debug.print("preB': {x}, preA': {y}", x=jnp.mean(preB.reshape(Bs.shape[0], -1), axis=-1), y=jnp.mean(preA.reshape(As.shape[0], -1), axis=-1))
-    
     B = jnp.mean(preB, axis=0)
     A = jnp.mean(preA , axis=0)
-
-    # print(B.dtype, A.dtype)
-
-    # jax.debug.print("scores: {scores}", scores=jnp.var(broadcasted_scores.ravel()))
-    # jax.debug.print("scores: {scores}", scores=jnp.mean(jnp.abs(jnp.sum(jnp.reshape(broadcasted_scores, (-1, 2)), axis=-1))))
-    # jax.debug.print("scores: {scores}", scores=jnp.mean(jnp.abs(jnp.mean(broadcasted_scores / broadcasted_sigma, axis=0))))
-    # jax.debug.print("raw Bs: {x} {y}", x=jnp.mean(jnp.abs(Bs)), y=jnp.mean(jnp.abs(As)))
-    # jax.debug.print("alt Bs: {x} {y}", x=jnp.mean(jnp.abs(jnp.mean(broadcasted_scores * Bs, axis=0))), y=jnp.mean(jnp.abs(jnp.mean(broadcasted_scores * As, axis=0))))
-    # jax.debug.print("actual B: {x} {y}", x=jnp.mean(jnp.abs(B)), y=jnp.mean(jnp.abs(A)))
-
-
     actual_grad = A @ B.mT
-    # print("lora update", param.shape, Bs.shape, As.shape, broadcasted_scores.shape, actual_grad.shape)
     return jnp.astype(param + actual_grad, param.dtype)
 
 def _do_update(params, model_keys, raw_scores, lr):
@@ -366,25 +294,21 @@ def _do_update(params, model_keys, raw_scores, lr):
     true_scores = (raw_scores - jnp.mean(raw_scores, keepdims=True)) / jnp.sqrt(jnp.var(raw_scores, keepdims=True) + 1e-5)
     
     def inner_update(param, model_key, lora_map_ans):
-        # print(param.shape, model_key[0].shape, lora_map_ans)
-        # return param
         if lora_map_ans == UNCHANGED:
             return param
 
-        # update_fn = [simple_full_update, simple_lora_update][lora_map_ans - 1]
         update_fn = [simple_full_update, simple_lora_update][lora_map_ans - 1]
         
         if len(model_key[0].shape) == 1:
-            # print("SINGLE")
             return update_fn(param, model_key, true_scores, lr)
         else:
-            # print("SCAN")
             return jax.lax.scan(lambda _, x: (0, update_fn(x[0], x[1], true_scores, lr)), 0, xs=(param, (jnp.moveaxis(model_key[0], 0, 1), jnp.moveaxis(model_key[1], 0, 1))))[1]
 
     return jax.tree.map(inner_update, params, model_keys, lora_map)
-    
 
-batch_fitness = jax.jit(jax.vmap(single_fitness))
+params = jax.device_put(params, jax.local_devices()[0]) # move it to gpu (or whatever the default device is)
+init_state = RWKV.default_state(params, config)
+init_states = jnp.repeat(init_state[None], args.parallel_generations, axis=0)
 
 key = jax.random.key(args.seed)
 key, master_evo_key = jax.random.split(key)
@@ -393,19 +317,14 @@ model_keys = fast_generate_model_keys(params, evo_keys, sigma_antithetic)
 
 print("Compiling generate batch")
 start_time = time.time()
-generate_batch = jax.jit(_generate_batch).lower(
-    params, model_keys, gen_keys
-).compile()
+generate_batch = jax.jit(_generate_batch).lower(params, model_keys, gen_keys).compile()
 print("Compile time", time.time() - start_time)
 print("memory info")
 print(generate_batch.memory_analysis())
-
 print()
 print("Compiling do update")
 start_time = time.time()
-do_update = jax.jit(_do_update).lower(
-    params, model_keys, jnp.zeros(args.parallel_generations), args.lr
-).compile()
+do_update = jax.jit(_do_update).lower(params, model_keys, jnp.zeros(args.parallel_generations), args.lr).compile()
 print("Compile time", time.time() - start_time)
 print("memory info")
 print(do_update.memory_analysis())
@@ -414,10 +333,10 @@ if args.track:
     run = wandb.init(
         project=args.wandb_project,
         config=args,
-        name=args.wandb_name+f"_lr={args.lr}_sigma={args.evo_sigma}_bs={args.parallel_generations}"
+        name=args.reward_fn+args.wandb_name+f"_lr={args.lr}_sigma={args.evo_sigma}_bs={args.parallel_generations}"
     )
-
-import operator
+else:
+    print("Run name:", args.reward_fn+args.wandb_name+f"_lr={args.lr}_sigma={args.evo_sigma}_bs={args.parallel_generations}")
 
 for epoch in tqdm.trange(args.num_epochs):
     start_time = time.time()
@@ -439,7 +358,7 @@ for epoch in tqdm.trange(args.num_epochs):
     start_time = time.time()
     if epoch == 0:
         print("calculating fitness")
-    output_scores = jax.block_until_ready(batch_fitness(output_batch))
+    output_scores = jax.block_until_ready(batch_fitness(output_batch, tokenizer))
     # print(np.array(output_scores).tolist())
     if epoch == 0:
         print("updating params")
@@ -473,49 +392,3 @@ for epoch in tqdm.trange(args.num_epochs):
 
 if args.track:
     run.finish()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # params, key_params, tokens, state, length
-
-# print("Compiling")
-# start_time = time.time()
-# forward_and_sample = jax.jit(_forward_and_sample).lower(
-#     params, model_keys, jax.random.choice(key, params['emb']['weight'].shape[0], shape=(args.parallel_generations, 1)), init_states, jax.random.split(key, args.parallel_generations)
-# ).compile()
-# print("Compile time", time.time() - start_time)
-# print("memory info")
-# print(forward_and_sample.memory_analysis())
-    
-# print("doing warmup")
-# for x in tqdm.trange(args.warmup_iters):
-#     key, _key = jax.random.split(key)
-#     prompt = jax.random.choice(_key, params['emb']['weight'].shape[0], shape=(args.parallel_generations, 1))
-#     input_toks, input_states, _ = jax.block_until_ready(forward_and_sample(params, model_keys, prompt, init_states, jax.random.split(_key, args.parallel_generations)))
-
-# print("start timing")
-# total_time = 0
-# input_toks = jax.block_until_ready(jnp.zeros((args.parallel_generations, 1), dtype=jnp.int32))
-# input_states = init_states
-# for x in tqdm.trange(args.timing_iters):
-#     start_time = time.time()
-#     input_toks, input_states, gen_keys = jax.block_until_ready(forward_and_sample(params, model_keys, input_toks, input_states, gen_keys))
-#     total_time += time.time() - start_time
-# ans = args.timing_iters * args.parallel_generations / total_time
-# print("tokens per second:", ans)
-
-# with open("evo_times.txt", "a") as myfile:
-#     myfile.write(f"{args.parallel_generations}\t{ans}\n")

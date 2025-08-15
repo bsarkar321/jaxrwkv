@@ -9,6 +9,7 @@ import jax.numpy as jnp
 
 from jaxrwkv import get_model, models
 from jaxrwkv.rwkv7 import layer_norm, group_norm
+from jaxrwkv.tokenizer import LegacyWorldTokenizer
 
 from functools import partial
 
@@ -20,10 +21,14 @@ import tqdm
 from typing import Optional, Literal
 
 import time
-
 import wandb
 
 import numpy as np
+
+from simple_reward_functions import reward_functions # local import
+
+import operator
+
 
 @dataclass
 class Args:
@@ -33,36 +38,39 @@ class Args:
     rwkv_type: str = "CudaRWKV"
     dtype: Optional[str] = None
 
-    parallel_generations: int = 128
-    generation_length: int = 100
+    parallel_generations: int = 1024
+    generation_length: int = 1000
 
-    num_epochs: int = 10
+    num_epochs: int = 100
 
-    lr: float = 1e-5
-    evo_sigma: float = 1e-5
+    lr: float = 1e-4
+    evo_sigma: float = 1e-3
     lora_dim: int = 1
 
     use_antithetic: bool = True
 
     wandb_project: str = "evorwkv"
-    wandb_name: str = "base"
-    track: bool = True
+    wandb_name: str = "full"
+    track: bool = False
 
     freeze_lora: bool = False
     freeze_nonlora: bool = False
 
+    # math specific params
+    generations_per_prompt: int = 8
+
 args = tyro.cli(Args)
+
+assert args.parallel_generations % args.generations_per_prompt == 0, "The number of generations per prompt should evenly divide into parallel generations"
+
+args.prompts_per_epoch = args.parallel_generations // args.generations_per_prompt
+
+
+RWKV, params, config, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
+legacy_tokenizer = LegacyWorldTokenizer()
 
 if args.use_antithetic:
     assert args.parallel_generations % 2 == 0, "With antithetic generations, there should be even number of parallel generations"
-
-RWKV, params, config, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
-params = jax.device_put(params, jax.local_devices()[0]) # move it to gpu (or whatever the default device is)
-init_state = RWKV.default_state(params, config)
-init_states = jnp.repeat(init_state[None], args.parallel_generations, axis=0)
-
-params_shape = jax.tree.map(lambda x:x.shape, params)
-print(params_shape)
 
 
 ###### Evolution Model Implementation
@@ -212,7 +220,7 @@ batch_forward = jax.jit(jax.vmap(partial(EvoRWKV.evo_forward, config=config), in
 def _forward_and_sample(model, model_keys, input_tokens, input_states, generation_key):
     print("RECOMPILE")
     gen_keys, _gen_keys = jax.vmap(jax.random.split, out_axes=1)(generation_key)
-    generated_outs, generated_states = jax.block_until_ready(batch_forward(model, model_keys, input_tokens, init_states))
+    generated_outs, generated_states = jax.block_until_ready(batch_forward(model, model_keys, input_tokens, input_states))
     sampled_toks = jax.vmap(jax.random.categorical)(_gen_keys, generated_outs[:, -1:])
     return sampled_toks, generated_states, gen_keys
 
@@ -238,6 +246,108 @@ lora_map = {'blocks': {
 
 #### End evolution model implementation
 
+
+# DEVELOP DATASET
+
+from datasets import load_dataset
+dataset_id = "openai/gsm8k" #"AI-MO/NuminaMath-TIR"
+train_dataset, test_dataset = load_dataset(dataset_id, "main", split=["train", "test"])
+def make_conversation(example):
+    # return {"prompt": SYSTEM_PROMPT + "\n\n" + f"User: {example['question']}" + "\n\nAssistant: <think"}
+    return {"prompt": f"User: {example['question']}\n\nAssistant: <think"}
+
+train_dataset = train_dataset.map(make_conversation)
+test_dataset = test_dataset.map(make_conversation)
+
+def safe_decode(tokens, tokenizer):
+    try:
+        stop_tokens = np.flatnonzero(tokens==0)
+        if stop_tokens.size > 0:
+            tokens = tokens[:stop_tokens[0]]
+        return legacy_tokenizer.decode(tokens)
+    except BaseException as e:
+        # print("decoding exception")
+        return ""
+
+
+
+import re
+
+# code from https://github.com/tianlwang/eval_gsm8k
+
+def extract_predicted_answer(text):
+    regex_pattern = "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+    regexes_to_ignore =[
+        ",",
+        "\\$",
+        "(?s).*#### ",
+        "\\.$"
+    ]
+    match = re.findall(regex_pattern, text)
+    if match:
+        match = match[-1]
+        if isinstance(match, tuple):
+            match = [m for m in match if m][0]
+        text = match.strip()
+
+        for regex in regexes_to_ignore:
+            text = re.sub(regex, "", text)
+        return text
+    else:
+        print("NO REGEX MATCH FOUND")
+        return None
+
+def extract_ground_truth(text):
+    return text.split('####')[-1].strip()
+
+def check_accuracy(generated_ans, solution):
+    ground_truth_answer = extract_ground_truth(solution)
+    # print(f"ground truth answer: {ground_truth_answer}")
+    # print("model answer (unparsed)", generated_ans.strip())
+    model_answer = extract_predicted_answer(generated_ans.strip())
+    # print(f"model answer: {model_answer}; ground truth answer: {ground_truth_answer}")
+    return 1.0 if (model_answer == ground_truth_answer) else 0.0
+    
+def single_fitness(generated_answer, true_answer, i):
+    find_idx = generated_answer.find("</think>")
+    if find_idx == -1:
+        return 0.0
+    true_idx = find_idx + len("</think>")
+    generated_ans = generated_answer[true_idx:]
+    return check_accuracy(generated_answer[true_idx:], true_answer)
+    
+
+def batch_fitness(tokens_batch, tokenizer, batch_answers):
+    rewards = []
+    print("tokens batch shape", tokens_batch.shape)
+    tokens_batch = np.array(tokens_batch)
+    saw_correct = False
+    saw_incorrect = False
+    for i, tok_seq in enumerate(tokens_batch):
+        gen_ans = safe_decode(tok_seq, tokenizer)
+        if len(gen_ans) == 0:
+            reward = 0.0
+        else:
+            reward = single_fitness(gen_ans, batch_answers[i//args.generations_per_prompt], i)
+        rewards.append(reward)
+        if reward == 0.0 and not saw_incorrect:
+            print("Incorrect sample:", i)
+            print("*"*20)
+            print(gen_ans)
+            print("*"*20)
+            # print(tok_seq)
+            saw_incorrect=True
+            
+        if reward == 1.0 and not saw_correct:
+            print("Correct sample:", i)
+            print("*"*20)
+            print(gen_ans)
+            print("*"*20)
+            saw_correct=True
+    return jnp.array(rewards)
+
+# DONE DEVELOPING DATASET
+
 def generate_keys_from_master(master_evo_key):
     if args.use_antithetic:
         core_evo_keys = jnp.repeat(jax.random.split(master_evo_key, args.parallel_generations // 2), 2, axis=0)
@@ -250,35 +360,17 @@ def generate_keys_from_master(master_evo_key):
         sigma_antithetic = args.evo_sigma * jnp.ones(args.parallel_generations, dtype=init_state.dtype)
     return evo_keys, gen_keys, sigma_antithetic
 
-def _generate_batch(params, model_keys, gen_keys):
+def _generate_batch(params, model_keys, gen_keys, batch_prompts):
     input_toks = jax.block_until_ready(jnp.zeros((gen_keys.shape[0], 1), dtype=jnp.int32))
-    def inner_scan(carry, inputs):
+    def inner_scan(carry, input_tokens):
         toks, states, gen_keys = carry
-        toks, states, gen_keys = _forward_and_sample(params, model_keys, toks, states, gen_keys)
-        return (toks, states, gen_keys), toks[:, 0]
-    _, out_tokens = jax.lax.scan(inner_scan, (input_toks, init_states, gen_keys), length=args.generation_length)
+        true_input = jnp.where(input_tokens == 0, toks[:, 0], input_tokens)
+        toks, states, gen_keys = _forward_and_sample(params, model_keys, true_input, states, gen_keys)
+        return (toks, states, gen_keys), true_input
+    _, out_tokens = jax.lax.scan(inner_scan, (input_toks, init_states, gen_keys), batch_prompts.T)
     return out_tokens.T
 
-def single_fitness(generated_tokens):
-    # return -jax.numpy.nonzero(generated_tokens == 0, size=1, fill_value=args.generation_length*2)[0][0].astype(jnp.float32)
-    # return jnp.sum(jnp.where(jnp.unique_counts(generated_tokens, size=generated_tokens.shape[0]).counts == 0, 0, 1)).astype(jnp.float32)
-    return jnp.max(jnp.unique_counts(generated_tokens, size=generated_tokens.shape[0]).counts).astype(jnp.float32)
-
-batch_fitness = jax.jit(jax.vmap(single_fitness))
-
-# def safe_decode(tokens):
-#     try:
-#         return tokenizer.decode(tokens)
-#     except BaseException as e:
-#         return ""
-
-
-# def batch_fitness(batch_generated_tokens):
-#     stop_tokens = jax.vmap(partial(jnp.flatnonzero, size=1, fill_value=-1))(batch_generated_tokens == 0)
-#     numpy_tokens = np.array(batch_generated_tokens)
-#     num_digits = [sum(c.isdigit() for c in safe_decode(numpy_tokens[i, :stop_tokens[i, 0]])) for i in range(numpy_tokens.shape[0])]
-#     return jnp.array(num_digits).astype(jnp.float32)
-    
+# batch_fitness = reward_functions[args.reward_fn]
 
 def simple_full_update(param, key, scores, lr):
     if args.freeze_nonlora:
@@ -310,7 +402,9 @@ def simple_lora_update(param, key, scores, lr):
 
 def _do_update(params, model_keys, raw_scores, lr):
 
-    true_scores = (raw_scores - jnp.mean(raw_scores, keepdims=True)) / jnp.sqrt(jnp.var(raw_scores, keepdims=True) + 1e-5)
+    group_scores = raw_scores.reshape((-1, args.generations_per_prompt))
+    true_scores = (group_scores - jnp.mean(group_scores, axis=-1, keepdims=True)).ravel()
+    # true_scores = (raw_scores - jnp.mean(raw_scores, keepdims=True)) / jnp.sqrt(jnp.var(raw_scores, keepdims=True) + 1e-5)
     
     def inner_update(param, model_key, lora_map_ans):
         if lora_map_ans == UNCHANGED:
@@ -325,6 +419,11 @@ def _do_update(params, model_keys, raw_scores, lr):
 
     return jax.tree.map(inner_update, params, model_keys, lora_map)
 
+params = jax.device_put(params, jax.local_devices()[0]) # move it to gpu (or whatever the default device is)
+init_state = RWKV.default_state(params, config)
+init_states = jnp.repeat(init_state[None], args.parallel_generations, axis=0)
+
+
 key = jax.random.key(args.seed)
 key, master_evo_key = jax.random.split(key)
 evo_keys, gen_keys, sigma_antithetic = generate_keys_from_master(master_evo_key)
@@ -332,11 +431,10 @@ model_keys = fast_generate_model_keys(params, evo_keys, sigma_antithetic)
 
 print("Compiling generate batch")
 start_time = time.time()
-generate_batch = jax.jit(_generate_batch).lower(params, model_keys, gen_keys).compile()
+generate_batch = jax.jit(_generate_batch).lower(params, model_keys, gen_keys, jnp.zeros((args.parallel_generations, args.generation_length), dtype=jnp.int32)).compile()
 print("Compile time", time.time() - start_time)
 print("memory info")
 print(generate_batch.memory_analysis())
-
 print()
 print("Compiling do update")
 start_time = time.time()
@@ -349,17 +447,27 @@ if args.track:
     run = wandb.init(
         project=args.wandb_project,
         config=args,
-        name=args.wandb_name+f"_lr={args.lr}_sigma={args.evo_sigma}_bs={args.parallel_generations}"
+        name="gsm8k_"+args.wandb_name+f"_lr={args.lr}_sigma={args.evo_sigma}_bs={args.parallel_generations}"
     )
+else:
+    print("Run name:", "gsm8k_"+args.wandb_name+f"_lr={args.lr}_sigma={args.evo_sigma}_bs={args.parallel_generations}")
 
-import operator
+max_len = 0
 
+def get_padded_prompt(single_prompt):
+    single_prompt = single_prompt[:args.generation_length]
+    return single_prompt + [0] * (args.generation_length - len(single_prompt))
+    
 for epoch in tqdm.trange(args.num_epochs):
+    start_time = time.time()
+    batch_answers = [train_dataset[(epoch * args.prompts_per_epoch + i) % len(train_dataset)]["answer"] for i in range(args.prompts_per_epoch)]
+    batch_prompts = jnp.repeat(jnp.array([get_padded_prompt(tokenizer.encode(train_dataset[(epoch * args.prompts_per_epoch + i) % len(train_dataset)]["prompt"])) for i in range(args.prompts_per_epoch)]), args.generations_per_prompt, axis=0)
+    prompt_processing_time = time.time() - start_time
+
+    
     start_time = time.time()
     key, master_evo_key = jax.random.split(key)
     evo_keys, gen_keys, sigma_antithetic = generate_keys_from_master(master_evo_key)
-    
-    # print(evo_keys, sigma_antithetic)
     if epoch == 0:
         print("generating model keys")
     model_keys = fast_generate_model_keys(params, evo_keys, sigma_antithetic)
@@ -368,13 +476,17 @@ for epoch in tqdm.trange(args.num_epochs):
     start_time = time.time()
     if epoch == 0:
         print("generating batch")
-    output_batch = jax.block_until_ready(generate_batch(params, model_keys, gen_keys))
+    output_batch = jax.block_until_ready(generate_batch(params, model_keys, gen_keys, batch_prompts))
     token_generation_time = time.time() - start_time
 
+    
     start_time = time.time()
     if epoch == 0:
         print("calculating fitness")
-    output_scores = jax.block_until_ready(batch_fitness(output_batch))
+    output_scores = jax.block_until_ready(batch_fitness(output_batch, tokenizer, batch_answers))
+    fitness_time = time.time() - start_time
+
+    start_time = time.time()
     # print(np.array(output_scores).tolist())
     if epoch == 0:
         print("updating params")
@@ -387,24 +499,31 @@ for epoch in tqdm.trange(args.num_epochs):
     # print(jax.tree.map(lambda x, y:jnp.mean(jnp.abs(x-y)), params, updated_params))
     
     params = updated_params
+
+    stats = {
+        "avg_fitness": jnp.mean(output_scores),
+        "std_fitness": jnp.std(output_scores),
+        "max_fitness": jnp.max(output_scores),
+        "min_fitness": jnp.min(output_scores),
+        "median_fitness": jnp.median(output_scores),
+        "lora_updates": lora_updates,
+        "nonlora_updates": nonlora_updates,
+        "prompt_preproc_time": prompt_processing_time,
+        "keygen_time": key_generation_time,
+        "token_gen_time": token_generation_time,
+        "fitness_time": fitness_time,
+        "update_time": parameter_update_time
+    }
     if args.track:
-        run.log({
-            "avg_fitness": jnp.mean(output_scores),
-            "std_fitness": jnp.std(output_scores),
-            "max_fitness": jnp.max(output_scores),
-            "min_fitness": jnp.min(output_scores),
-            "median_fitness": jnp.median(output_scores),
-            "lora_updates": lora_updates,
-            "nonlora_updates": nonlora_updates,
-            "keygen_time": key_generation_time,
-            "token_gen_time": token_generation_time,
-            "update_time": parameter_update_time
-        })
+        run.log(stats)
     else:
         print(f"Mean fitness: {jnp.mean(output_scores)}; std fitness: {jnp.std(output_scores)}; max fitness: {jnp.max(output_scores)}; min fitness: {jnp.min(output_scores)}; median fitness: {jnp.median(output_scores)}")
         print("mean parameter diffs")
         print("Lora modules:", lora_updates)
         print("Full modules:", nonlora_updates)
+        print("Stats:")
+        for k in stats:
+            print(f"\t{k}: {stats[k]}")
 
 if args.track:
     run.finish()

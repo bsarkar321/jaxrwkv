@@ -218,7 +218,7 @@ batch_forward = jax.jit(jax.vmap(partial(EvoRWKV.evo_forward, config=config), in
 def _forward_and_sample(model, model_keys, input_tokens, input_states, generation_key):
     print("RECOMPILE")
     gen_keys, _gen_keys = jax.vmap(jax.random.split, out_axes=1)(generation_key)
-    generated_outs, generated_states = jax.block_until_ready(batch_forward(model, model_keys, input_tokens, init_states))
+    generated_outs, generated_states = jax.block_until_ready(batch_forward(model, model_keys, input_tokens, input_states))
     sampled_toks = jax.vmap(jax.random.categorical)(_gen_keys, generated_outs[:, -1:])
     return sampled_toks, generated_states, gen_keys
 

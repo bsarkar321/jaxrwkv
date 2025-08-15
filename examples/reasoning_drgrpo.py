@@ -256,6 +256,7 @@ num_epochs = len(train_dataset) // args.prompts_per_epoch
 key = jax.random.key(args.seed)
 
 def get_reward(generated_answer, true_answer, i):
+    ans = generated_answer
     find_idx = ans.find("</think>")
     if find_idx == -1:
         print(i, "unable to find end of think")
