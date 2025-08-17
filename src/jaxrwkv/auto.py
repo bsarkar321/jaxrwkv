@@ -76,7 +76,7 @@ def get_rand_model(seed, version, n_layer, n_embd, vocab_size, config=None, dtyp
         rwkv_params, config = load(path)
     else:
         key = jax.random.key(seed)
-        with jax.default_device(jax.devices("cpu")[0]):
+        with jax.default_device(jax.local_devices(backend="cpu")[0]):
             rwkv_params, config = RWKV.randomize_weights(key, n_layer, n_embd, vocab_size, config, dtype)
         if verbose:
             print("saving to", path)
@@ -155,7 +155,7 @@ def load(path: str | Path) -> any:
         raise ValueError(f'Not a file: {path}')
     if path.suffix != suffix:
         raise ValueError(f'Not a {suffix} file: {path}')
-    with jax.default_device(jax.devices("cpu")[0]):
+    with jax.default_device(jax.local_devices(backend="cpu")[0]):
         with open(path, 'rb') as file:
             data = pickle.load(file)
     return data

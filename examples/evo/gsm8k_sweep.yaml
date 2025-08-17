@@ -1,0 +1,46 @@
+program: general_do_evolution.py
+name: gsmk8_1.5B_evo
+method: bayes
+metric:
+  goal: maximize
+  name: true_train_avg_fitness
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: !!float 1e-9
+    max: !!float 1e-3
+  evo_sigma:
+    distribution: log_uniform_values
+    min: !!float 1e-6
+    max: !!float 1e-3
+  model_choice:
+    value: 7g1.5B
+  parallel_generations_per_gpu:
+    value: 128
+  generation_length:
+    value: 1000
+  num_epochs:
+    value: 128
+  task:
+    value: gsm8k
+  group_relative_fitness:
+    value: True
+  freeze_nonlora:
+    value: True
+  track:
+    value: True
+  muon:
+    values: [True, False]
+  schedule_free:
+    values: [True, False]
+  
+  
+early_terminate:
+  type: hyperband
+  eta: 2
+  min_iter: 8
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args_no_boolean_flags}

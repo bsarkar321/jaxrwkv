@@ -22,7 +22,7 @@ class LLM:
         w = cls.transform_torch_model(torch_model, dtype=dtype)
         cfg = cls.transform_config(config)
         for k in w.keys():
-            w[k] = jnp.array(w[k].float().numpy(), dtype=dtype, device=jax.devices("cpu")[0])
+            w[k] = jnp.array(w[k].float().numpy(), dtype=dtype, device=jax.local_devices(backend="cpu")[0])
 
         ans = {}
         ans['blocks'] = {}
