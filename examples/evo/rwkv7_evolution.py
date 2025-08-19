@@ -29,29 +29,40 @@ lora_map = {'blocks': {
 def fold_in_helper(key, epoch, true_thread_idx):
     return jax.random.fold_in(jax.random.fold_in(key, epoch), true_thread_idx)
 
-def get_lora_update_params(iterinfo, param, key, lora_dim):
+def do_normalize(x):
+    return x / (jnp.linalg.norm(x, axis=0) + 1e-5)
+
+def get_lora_update_params(iterinfo, param, key, lora_dim, lora_config):
     epoch, sigma, true_thread_idx = iterinfo
+
+    outer_epoch = 0 if len(lora_config) <= 2 or lora_config[2] == '0' else (epoch // int(lora_config[2:]))
+    
     a, b = param.shape
     lora_params = jax.random.normal(fold_in_helper(key, epoch, true_thread_idx), (a+b, lora_dim), dtype=param.dtype)
-    lora_const_params = jax.random.normal(jax.random.fold_in(key, epoch), (a+b, lora_dim), dtype=param.dtype)
+    lora_const_params = jax.random.normal(jax.random.fold_in(key, outer_epoch), (a+b, lora_dim), dtype=param.dtype)
+
+    nonzero_A = (lora_config[0] == 'A') or (lora_config[0] == 'C' and outer_epoch % 2 == 0)
     
     B = lora_params[:b]
     A = lora_params[b:]
-    B = jax.lax.select(epoch % 2 == 0, jnp.zeros_like(B), B)
-    A = jax.lax.select(epoch % 2 == 0, A, jnp.zeros_like(A))
-    
 
     Bc = lora_const_params[:b]
     Ac = lora_const_params[b:]
-    Bc = jax.lax.select(epoch % 2 == 0, jax.nn.standardize(Bc, axis=0), jnp.zeros_like(Bc))
-    Ac = jax.lax.select(epoch % 2 == 0, jnp.zeros_like(Ac), jax.nn.standardize(Ac, axis=0))
-    # Bc = jnp.zeros_like(Bc)
-    # Ac = jax.nn.standardize(Ac, axis=0)
+    if lora_config[1] == '1':
+        Bc = jnp.ones_like(Bc)
+        Ac = jnp.ones_like(Ac)
+
+    A = jax.lax.select(nonzero_A, jnp.zeros_like(A), A)
+    B = jax.lax.select(nonzero_A, B, jnp.zeros_like(B))
+
+    Ac = jax.lax.select(nonzero_A, do_normalize(Ac) * jnp.sqrt(a), jnp.zeros_like(Ac))
+    Bc = jax.lax.select(nonzero_A, jnp.zeros_like(Bc), do_normalize(Bc) * jnp.sqrt(b))
+    
     return A, B, Ac, Bc
 
-def get_lora_params(iterinfo, param, key, lora_dim):
+def get_lora_params(iterinfo, param, key, lora_dim, lora_config):
     epoch, sigma, true_thread_idx = iterinfo
-    A, B, Ac, Bc = get_lora_update_params(iterinfo, param, key, lora_dim)
+    A, B, Ac, Bc = get_lora_update_params(iterinfo, param, key, lora_dim, lora_config)
     return (A * sigma + Ac).T, B * sigma + Bc
 
 def get_evo_class(args, RWKV):
@@ -59,14 +70,14 @@ def get_evo_class(args, RWKV):
         if args.freeze_lora:
             return M@param
 
-        A, B = get_lora_params(iterinfo, param, key, args.lora_dim)
+        A, B = get_lora_params(iterinfo, param, key, args.lora_dim, args.lora_config)
         return M @ param + (M @ A.T) @ B.T
 
     def evo_lora(iterinfo, M, param, key):
         if args.freeze_lora:
             return M@param.T
         
-        A, B = get_lora_params(iterinfo, param, key, args.lora_dim)
+        A, B = get_lora_params(iterinfo, param, key, args.lora_dim, args.lora_config)
         return M @ param.T + (M @ B) @ A
 
     def evo(iterinfo, param, key):
@@ -248,7 +259,7 @@ def RWKV7_Evolution(args, RWKV, config):
         # Bs = noises[:, :b]
         # As = jnp.ones_like(noises[:, b:])
         epoch, sigma, true_thread_idx = iterinfo
-        At, Bt, Ac, Bc = jax.vmap(get_lora_update_params, in_axes=(0, None, None, None))(iterinfo, param, key, args.lora_dim)
+        At, Bt, Ac, Bc = jax.vmap(partial(get_lora_update_params, lora_dim=args.lora_dim, lora_config=args.lora_config), in_axes=(0, None, None))(iterinfo, param, key)
         broadcasted_scores = jnp.reshape(scores, scores.shape + (1,) * len(param.shape))
         broadcasted_sigma = jnp.reshape(sigma, sigma.shape + (1,) * len(param.shape))# / lr
         preB = broadcasted_scores / broadcasted_sigma * Bt

@@ -1,6 +1,8 @@
-import jax
 import os
+import jax
 from huggingface_hub.constants import HF_HOME
+
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 
 jax.config.update("jax_compilation_cache_dir", os.path.join(HF_HOME, "jaxrwkvcomp"))
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -50,7 +52,8 @@ class Args:
 
     num_epochs: int = 100
 
-    lr: float = 1e-4
+    # lr: float = 1e-4
+    lr_scale: float = 1.0
     evo_sigma: float = 1e-3
     # lr_mult: float = 1e-6
     lora_dim: int = 1
@@ -65,6 +68,7 @@ class Args:
 
     freeze_lora: bool = False
     freeze_nonlora: bool = False
+    lora_config: str = "A1" # CN8
 
     muon: bool = False
     schedule_free: bool = False
@@ -92,6 +96,8 @@ print("process id", jax.process_index())
 
 args.proc_id = jax.process_index()
 args.total_parallel_generations = total_num_devices * args.parallel_generations_per_gpu
+
+args.lr = args.lr_scale * (args.evo_sigma ** 2) * np.sqrt(args.total_parallel_generations / (args.total_parallel_generations+2))
 mesh = jax.make_mesh((len(jax.devices()),), ('data',))
 
 print()
@@ -157,7 +163,7 @@ def _do_update(params, optimizer, raw_scores, epoch_num):
     grad = _get_gradient(params, raw_scores, epoch_num)
     updates, optimizer = solver.update(grad, optimizer, params)
     params = optax.apply_updates(params, updates)
-    return params, optimizer, jax.tree.map(lambda x: jnp.mean(jnp.abs(x)), updates)
+    return params, optimizer, jax.tree.map(lambda x: jnp.mean(x ** 2), updates)
 
 
 print()
@@ -174,7 +180,7 @@ print("Compile time", time.time() - start_time)
 print("memory info")
 print(do_update.memory_analysis())
 
-full_name = args.task+"_"+args.wandb_name+("_muon" if args.muon else "")+("_sf" if args.schedule_free else "")+f"_lr={args.lr}_sigma={args.evo_sigma}_bs={args.total_parallel_generations}"
+full_name = args.task+"_"+args.wandb_name+("_muon" if args.muon else "")+("_sf" if args.schedule_free else "")+f"_lr={args.lr:.2e}_sigma={args.evo_sigma:.2e}_bs={args.total_parallel_generations}"
 
 if args.track:
     run = wandb.init(
@@ -237,8 +243,8 @@ def single_epoch(params, optimizer, true_train_fitness_sum):
 
     # print("CURRENT MEMORY start of stats", jax.local_devices()[0].memory_stats())
     # parameter_differences = jax.tree.map(lambda x, y:jnp.mean(jnp.abs(x-y)), params, updated_params)
-    lora_updates = jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == LORA else 0.0, parameter_differences, lora_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == LORA else 0.0, lora_map))
-    nonlora_updates = jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == FULL else 0.0, parameter_differences, lora_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == FULL else 0.0, lora_map))
+    lora_updates = jnp.sqrt(jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == LORA else 0.0, parameter_differences, lora_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == LORA else 0.0, lora_map)))
+    nonlora_updates = jnp.sqrt(jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == FULL else 0.0, parameter_differences, lora_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == FULL else 0.0, lora_map)))
 
     # params = updated_params
     
