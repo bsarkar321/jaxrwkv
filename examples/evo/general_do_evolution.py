@@ -70,6 +70,7 @@ class Args:
     freeze_nonlora: bool = False
     lora_config: str = "A1" # CN8
 
+    adamw: bool = False
     muon: bool = False
     schedule_free: bool = False
 
@@ -145,9 +146,15 @@ print(generate_batch.memory_analysis())
 # solver = optax.contrib.mechanize(optax.sgd(1.0), s_init=args.evo_sigma*args.lr_mult)
 # solver = optax.adamw(args.lr)
 if args.schedule_free:
-    solver = optax.contrib.schedule_free_sgd(args.lr)
+    if args.adamw:
+        solver = optax.contrib.schedule_free_adamw(args.lr)
+    else:
+        solver = optax.contrib.schedule_free_sgd(args.lr)
 else:
-    solver = optax.sgd(args.lr)
+    if args.adamw:
+        solver = optax.adamw(args.lr)
+    else:
+        solver = optax.sgd(args.lr)
 
 solver = optax.masked(solver, jax.tree.map(lambda x: x!=UNCHANGED, lora_map))
 
@@ -180,7 +187,7 @@ print("Compile time", time.time() - start_time)
 print("memory info")
 print(do_update.memory_analysis())
 
-full_name = args.task+"_"+args.wandb_name+("_muon" if args.muon else "")+("_sf" if args.schedule_free else "")+f"_lr={args.lr:.2e}_sigma={args.evo_sigma:.2e}_bs={args.total_parallel_generations}"
+full_name = args.task+"_"+args.wandb_name+("_adamw" if args.adamw else "")+args.wandb_name+("_muon" if args.muon else "")+("_sf" if args.schedule_free else "")+f"_lr={args.lr:.2e}_sigma={args.evo_sigma:.2e}_bs={args.total_parallel_generations}"
 
 if args.track:
     run = wandb.init(

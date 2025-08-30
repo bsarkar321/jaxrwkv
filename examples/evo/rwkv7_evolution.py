@@ -39,9 +39,12 @@ def get_lora_update_params(iterinfo, param, key, lora_dim, lora_config):
     
     a, b = param.shape
     lora_params = jax.random.normal(fold_in_helper(key, epoch, true_thread_idx), (a+b, lora_dim), dtype=param.dtype)
-    lora_const_params = jax.random.normal(jax.random.fold_in(key, outer_epoch), (a+b, lora_dim), dtype=param.dtype)
+    if lora_config[0] == 'S':
+        lora_const_params = jax.random.normal(fold_in_helper(key, outer_epoch, true_thread_idx), (a+b, lora_dim), dtype=param.dtype)
+    else:
+        lora_const_params = jax.random.normal(jax.random.fold_in(key, outer_epoch), (a+b, lora_dim), dtype=param.dtype)
 
-    nonzero_A = (lora_config[0] == 'A') or (lora_config[0] == 'C' and outer_epoch % 2 == 0)
+    nonzero_A = (lora_config[0] == 'A') or (lora_config[0] in ['C', 'S'] and outer_epoch % 2 == 0)
     
     B = lora_params[:b]
     A = lora_params[b:]
@@ -266,14 +269,20 @@ def RWKV7_Evolution(args, RWKV, config):
         preA = broadcasted_scores / broadcasted_sigma * At
         # preA = As # not adapting
 
-        B = jnp.mean(Bc + preB, axis=0)
-        A = jnp.mean(Ac + preA, axis=0) # not adapting
+        if args.lora_config[0] == 'S':
+            A = Ac + preA
+            B = Bc + preB
+            print("A shape", A.shape, "B shape", B.shape)
+            actual_grad = jnp.mean(A @ B.mT, axis=0) # B x N x 1 @ B x 1 x N
+        else:
+            B = jnp.mean(Bc + preB, axis=0)
+            A = jnp.mean(Ac + preA, axis=0) # not adapting
 
-        if args.muon:
-            B = jax.nn.standardize(B, axis=0)
-            A = jax.nn.standardize(A, axis=0)
-        
-        actual_grad = A @ B.mT
+            if args.muon:
+                B = jax.nn.standardize(B, axis=0)
+                A = jax.nn.standardize(A, axis=0)
+
+            actual_grad = A @ B.mT
         return jnp.astype(actual_grad, param.dtype)
     
 
