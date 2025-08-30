@@ -220,7 +220,7 @@ def single_epoch(params, optimizer, true_train_fitness_sum):
     start_time = time.time()
     if epoch == 0:
         print("generating batch")
-    output_batch = jax.block_until_ready(generate_batch(params, batch_prompts, all_thread_idxes, 0 if args.es_single else epoch))
+    output_batch = jax.block_until_ready(generate_batch(params, batch_prompts, all_thread_idxes, epoch))
     token_generation_time = time.time() - start_time
 
     
@@ -246,7 +246,7 @@ def single_epoch(params, optimizer, true_train_fitness_sum):
     start_time = time.time()
     if epoch == 0:
         print("updating params")
-    params, optimizer, parameter_differences = jax.block_until_ready(do_update(params, optimizer, output_scores, 0 if args.es_single else epoch))
+    params, optimizer, parameter_differences = jax.block_until_ready(do_update(params, optimizer, output_scores, epoch))
     parameter_update_time = time.time() - start_time
 
     # print("CURRENT MEMORY start of stats", jax.local_devices()[0].memory_stats())

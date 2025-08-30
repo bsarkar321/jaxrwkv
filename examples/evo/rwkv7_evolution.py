@@ -38,13 +38,14 @@ def get_lora_update_params(iterinfo, param, key, lora_dim, lora_config):
     outer_epoch = 0 if len(lora_config) <= 2 or lora_config[2] == '0' else (epoch // int(lora_config[2:]))
     
     a, b = param.shape
-    lora_params = jax.random.normal(fold_in_helper(key, epoch, true_thread_idx), (a+b, lora_dim), dtype=param.dtype)
-    if lora_config[0] == 'S':
+    lora_params = jax.random.normal(fold_in_helper(key, outer_epoch if lora_config[0].islower() else epoch, true_thread_idx), (a+b, lora_dim), dtype=param.dtype)
+    lora_type = lora_config[0].upper()
+    if lora_type == 'S':
         lora_const_params = jax.random.normal(fold_in_helper(key, outer_epoch, true_thread_idx), (a+b, lora_dim), dtype=param.dtype)
     else:
         lora_const_params = jax.random.normal(jax.random.fold_in(key, outer_epoch), (a+b, lora_dim), dtype=param.dtype)
 
-    nonzero_A = (lora_config[0] == 'A') or (lora_config[0] in ['C', 'S'] and outer_epoch % 2 == 0)
+    nonzero_A = (lora_type == 'A') or (lora_type in ['C', 'S'] and outer_epoch % 2 == 0)
     
     B = lora_params[:b]
     A = lora_params[b:]
@@ -269,7 +270,7 @@ def RWKV7_Evolution(args, RWKV, config):
         preA = broadcasted_scores / broadcasted_sigma * At
         # preA = As # not adapting
 
-        if args.lora_config[0] == 'S':
+        if args.lora_config[0].upper() == 'S':
             A = Ac + preA
             B = Bc + preB
             print("A shape", A.shape, "B shape", B.shape)
